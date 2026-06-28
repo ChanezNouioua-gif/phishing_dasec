@@ -721,7 +721,8 @@ def parse_eml(raw_bytes: bytes) -> dict:
         "headers": dict(msg.items()), 
         "from": _decode_header(msg.get("From", "")), 
         "reply_to": _decode_header(msg.get("Reply-To", "")),
-        "return_path": _decode_header(msg.get("Return-Path", "")), 
+        "return_path": _decode_header(msg.get("Return-Path", "")),
+        "to": _decode_header(msg.get("To", "")), 
         "subject": _decode_header(msg.get("Subject", "")), 
         "date": _decode_header(msg.get("Date", "")),
         "message_id": _decode_header(msg.get("Message-ID", "")), 
@@ -1169,7 +1170,14 @@ async def analyze_eml(file: UploadFile = File(...)):
               "modules":{"headers":header_r,"urls":url_r,"images":image_r,"attachments":attach_r,
                         "nlp":text_r,"rag":rag_r,"threat_intel":ti_r},
               "report": report, "sigma_rules": sigma_r, "alert_sent": alert_sent,
-              "email_meta":{"from":parsed["from"],"subject":parsed["subject"],"date":parsed["date"]}}
+              "email_meta": {
+                 "from": parsed["from"],
+                 "to": parsed["to"],
+                 "reply_to": parsed["reply_to"],
+                 "return_path": parsed["return_path"],
+                 "subject": parsed["subject"],
+                 "date": parsed["date"],
+               }}
     aid = save_analysis(result, mode="eml", sender=parsed["from"], subject=parsed["subject"], alert_sent=alert_sent)
     result["analysis_id"] = aid
     return result
@@ -1187,7 +1195,8 @@ async def analyze_text_endpoint(req: TextRequest):
     result = {"score_global": score_global, "verdict": report.get("verdict","?"),
               "nlp": text_r, "urls": url_r, "rag": rag_r, "threat_intel": ti_r,
               "report": report, "sigma_rules": sigma_r,
-              "email_meta": {"from": req.sender, "subject": req.subject, "date": ""}}
+              "email_meta": {"from": req.sender, "subject": req.subject, 
+               "date": datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")}}
     aid = save_analysis(result, mode="text", sender=req.sender or "", subject=req.subject or "", alert_sent=False)
     result["analysis_id"] = aid
     return result
