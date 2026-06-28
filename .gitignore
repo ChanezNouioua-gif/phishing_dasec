@@ -4,3 +4,11 @@ __pycache__/
 *.pyc
 models/
 .env.example
+ 
+feeds/enterprise-attack.json 
+reports/ 
+*.pdf 
+data/ 
+ 
+frontend/node_modules/ 
+frontend/.next/ 
