@@ -655,32 +655,85 @@ def get_domain(url):
     m = re.search(r"(?:https?://)?(?:www\.)?([^/\s]+)", url)
     return m.group(1).lower() if m else ""
 
-def parse_eml(raw_bytes):
-    msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+
+
+def parse_eml(raw_bytes: bytes) -> dict:
+    # 1. Gestion robuste du parsing avec fallback si l'e-mail est mal formé
+    try:
+        msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+    except Exception:
+        msg = BytesParser(policy=policy.compat32).parsebytes(raw_bytes)
+    
+    # 2. Fonction interne pour décoder proprement les headers (ex: =?utf-8?B?...?=)
+    def _decode_header(val):
+        if not val:
+            return ""
+        try:
+            parts = _dh(str(val))
+            result = []
+            for part, enc in parts:
+                if isinstance(part, bytes):
+                    # Si aucun encodage n'est détecté, on fallback sur utf-8 ou ignore les erreurs
+                    result.append(part.decode(enc or "utf-8", errors="replace"))
+                else:
+                    result.append(str(part))
+            return " ".join(result).strip()
+        except Exception:
+            return str(val).strip() # Sécurité si le décodage échoue complètement
+
+    # 3. Extraction et parcours du contenu du mail
     body_text, body_html = "", ""
-    images, attachments  = [], []
+    images, attachments = [], []
+    
     for part in msg.walk():
         ct = part.get_content_type()
         cd = str(part.get("Content-Disposition", ""))
+        
         if ct == "text/plain" and "attachment" not in cd:
             body_text += part.get_content() or ""
         elif ct == "text/html" and "attachment" not in cd:
             body_html += str(part.get_content() or "")
         elif ct.startswith("image/"):
-            images.append({"content_type": ct, "data": part.get_payload(decode=True), "name": part.get_filename("image")})
+            images.append({
+                "content_type": ct, 
+                "data": part.get_payload(decode=True), 
+                "name": _decode_header(part.get_filename("image"))
+            })
         elif "attachment" in cd or part.get_filename():
             payload = part.get_payload(decode=True)
             if payload:
-                attachments.append({"filename": part.get_filename("unknown"), "content_type": ct,
-                                    "data": payload, "md5": hashlib.md5(payload).hexdigest(),
-                                    "sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload)})
+                filename = _decode_header(part.get_filename("unknown"))
+                attachments.append({
+                    "filename": filename, 
+                    "content_type": ct,
+                    "data": payload, 
+                    "md5": hashlib.md5(payload).hexdigest(),
+                    "sha256": hashlib.sha256(payload).hexdigest(), 
+                    "size": len(payload)
+                })
+                
+    # 4. Nettoyage du HTML et extraction globale du texte
     body_html_clean = re.sub(r"<[^>]+>", " ", body_html)
     full_text = f"{body_text} {body_html_clean}".strip()
-    return {"headers": dict(msg.items()), "from": msg.get("From", ""), "reply_to": msg.get("Reply-To", ""),
-            "return_path": msg.get("Return-Path", ""), "subject": msg.get("Subject", ""), "date": msg.get("Date", ""),
-            "message_id": msg.get("Message-ID", ""), "x_mailer": msg.get("X-Mailer", ""), "body_text": body_text,
-            "body_html": body_html, "full_text": full_text, "images": images, "attachments": attachments,
-            "urls_in_html": extract_urls(body_html), "urls_in_text": extract_urls(body_text)}
+    
+    # 5. Construction du dictionnaire de retour avec headers décodés
+    return {
+        "headers": dict(msg.items()), 
+        "from": _decode_header(msg.get("From", "")), 
+        "reply_to": _decode_header(msg.get("Reply-To", "")),
+        "return_path": _decode_header(msg.get("Return-Path", "")), 
+        "subject": _decode_header(msg.get("Subject", "")), 
+        "date": _decode_header(msg.get("Date", "")),
+        "message_id": _decode_header(msg.get("Message-ID", "")), 
+        "x_mailer": _decode_header(msg.get("X-Mailer", "")), 
+        "body_text": body_text,
+        "body_html": body_html, 
+        "full_text": full_text, 
+        "images": images, 
+        "attachments": attachments,
+        "urls_in_html": extract_urls(body_html), 
+        "urls_in_text": extract_urls(body_text)
+    }
 
 def analyze_headers(parsed):
     headers, findings, score = parsed["headers"], [], 0.0
@@ -768,32 +821,56 @@ def analyze_images(images):
         except Exception: pass
     return {"score": round(min(score, 1.0), 3), "ocr_text": " ".join(ocr_texts)[:500], "images_count": len(images), "findings": findings}
 
-def analyze_attachments(attachments):
+def analyze_attachments(attachments: list) -> dict:
     findings, suspicious_hashes, score = [], [], 0.0
     DANGEROUS_EXT = {".exe",".bat",".cmd",".ps1",".vbs",".js",".jar",".scr",".pif",".com",".msi"}
-    DOUBLE_EXT    = re.compile(r"\.(pdf|docx?|xlsx?|zip)\.(exe|bat|cmd|scr)$", re.I)
+    DOUBLE_EXT    = re.compile(r"\.(pdf|docx?|xlsx?|zip)\.(exe|bat|cmd|scr|ps1|vbs)$", re.I)
+    
     for att in attachments:
-        fname, ct = att["filename"].lower(), att["content_type"]
+        fname = att["filename"].lower()
+        ct    = att["content_type"]
+        
+        # Double extension — vérification en premier, indépendante du contenu
+        if DOUBLE_EXT.search(fname):
+            findings.append(f"Double extension dangereuse : {att['filename']}")
+            score += 0.50
+        
+        # Extension dangereuse simple
         for ext in DANGEROUS_EXT:
             if fname.endswith(ext):
-                findings.append(f"Extension dangereuse : {att['filename']}"); score += 0.40; break
-        if DOUBLE_EXT.search(fname):
-            findings.append(f"Double extension : {att['filename']}"); score += 0.50
-        try:
-            import magic
-            real_mime = magic.from_buffer(att["data"][:1024], mime=True)
-            if real_mime and real_mime not in ct:
-                findings.append(f"MIME réel ({real_mime}) ≠ déclaré ({ct})"); score += 0.35
-        except Exception: pass
+                findings.append(f"Extension dangereuse : {att['filename']}")
+                score += 0.40
+                break
+        
+        # MIME mismatch — seulement si payload suffisant
+        if att.get("data") and len(att["data"]) >= 32:
+            try:
+                import magic
+                real_mime = magic.from_buffer(att["data"][:1024], mime=True)
+                if real_mime and real_mime not in ct:
+                    findings.append(f"MIME réel ({real_mime}) ≠ déclaré ({ct})")
+                    score += 0.35
+            except Exception:
+                pass
+        
+        # Macros VBA
         if fname.endswith((".doc",".docx",".xls",".xlsx",".ppt",".pptx")):
             try:
                 from oletools.olevba import VBA_Parser
                 vba = VBA_Parser(att["filename"], data=att["data"])
                 if vba.detect_vba_macros():
-                    findings.append(f"Macros VBA : {att['filename']}"); score += 0.45
-            except Exception: pass
-        suspicious_hashes.append({"filename": att["filename"], "md5": att["md5"], "sha256": att["sha256"], "size": att["size"]})
-    return {"score": round(min(score, 1.0), 3), "attachments_count": len(attachments), "suspicious_hashes": suspicious_hashes, "findings": findings}
+                    findings.append(f"Macros VBA : {att['filename']}")
+                    score += 0.45
+            except Exception:
+                pass
+        
+        suspicious_hashes.append({
+            "filename": att["filename"], "md5": att["md5"],
+            "sha256": att["sha256"], "size": att["size"]
+        })
+    
+    return {"score": round(min(score, 1.0), 3), "attachments_count": len(attachments),
+            "suspicious_hashes": suspicious_hashes, "findings": findings}
 
 def analyze_text(text):
     text_clean = clean_text(text)
@@ -900,7 +977,16 @@ Réponds STRICTEMENT avec un JSON valide, sans texte avant/après, sans markdown
         raw = _call_llm(prompt)
         raw = re.sub(r"```json|```", "", raw).strip()
         m   = re.search(r"\{.*\}", raw, re.DOTALL)
-        return _json.loads(m.group() if m else raw)
+        result = _json.loads(m.group() if m else raw)
+        
+        # ← AJOUTE CES LIGNES : override le verdict LLM si score contredit
+        if score_global < 0.35 and result.get("verdict") == "PHISHING":
+            result["verdict"] = "LEGITIME"
+            result["confiance"] = "moyenne"
+        elif score_global < 0.55 and result.get("verdict") == "PHISHING":
+            result["verdict"] = "SUSPECT"
+        
+        return result
     except Exception as e:
         verdict = ("PHISHING" if score_global >= 0.65 else "SUSPECT" if score_global >= 0.35 else "LEGITIME")
         return {"verdict": verdict, "confiance": "moyenne", "score_final": score_global,
@@ -1012,11 +1098,16 @@ def compute_global_score(header_r, url_r, image_r, attach_r, text_r, ti_r, mode=
             text_r["score"]        * 0.30 +
             url_r["score"]         * 0.45 +
             ti_r.get("score", 0.0) * 0.20 +
-            url_bonus,
-        4)
-    return round(header_r["score"]*0.25 + text_r["score"]*0.20 + url_r["score"]*0.20 +
-                attach_r["score"]*0.10 + ti_r.get("score",0.0)*0.15 + image_r["score"]*0.05 +
-                (len(url_r["suspicious"])>0)*0.05, 4)
+            url_bonus, 4)
+    # Mode full — augmente le poids attachments de 0.10 → 0.15
+    return round(
+        header_r["score"]          * 0.20 +
+        text_r["score"]            * 0.20 +
+        url_r["score"]             * 0.20 +
+        attach_r["score"]          * 0.15 +   # était 0.10
+        ti_r.get("score", 0.0)     * 0.15 +
+        image_r["score"]           * 0.05 +
+        (len(url_r["suspicious"]) > 0) * 0.05, 4)
 
 # ══════════════════════════════════════════════════════════════
 # FASTAPI
