@@ -1,5 +1,5 @@
 
-import re, os, sys, json, pickle, hashlib, time, uuid, yaml, sqlite3
+import re, os, sys, json, pickle, hashlib, time, uuid, yaml, sqlite3, threading
 import torch
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
@@ -467,15 +467,23 @@ col_live       = _get_col("live_ioc_feeds")
 RAG_OK         = all([col_techniques, col_apt, col_ti])
 
 import json as _json
-def _load_set(path):
+def _load_set_txt(path):
+    """Charge un fichier texte (une URL/ligne, # = commentaire) en set."""
     try:
-        with open(path) as f:
-            return set(_json.load(f))
-    except Exception:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = {l.strip() for l in f if l.strip() and not l.startswith("#")}
+        print(f"✅ Feed chargé : {path} — {len(lines):,} entrées")
+        return lines
+    except FileNotFoundError:
+        print(f"⚠️ Feed introuvable : {path}")
+        return set()
+    except Exception as e:
+        print(f"⚠️ Erreur chargement feed {path} : {e}")
         return set()
 
-urlhaus_set   = _load_set(f"{IOC_CACHE_DIR}/urlhaus.json")
-openphish_set = _load_set(f"{IOC_CACHE_DIR}/openphish.json")
+urlhaus_set   = _load_set_txt(f"{IOC_CACHE_DIR}/urlhaus.abuse.ch.txt")
+openphish_set = _load_set_txt(f"{IOC_CACHE_DIR}/openphish.txt")
+
 
 llm_client  = None
 llm_backend = None
@@ -513,13 +521,16 @@ print(f"✅ Chargé | RAG={'OK' if RAG_OK else 'KO'} | LLM={llm_backend or 'none
 VT_API_KEY    = os.getenv("VT_API_KEY", "")
 ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_KEY", "")
 _ti_cache     = {}
+_ti_cache_lock = threading.Lock()
 _ti_executor  = ThreadPoolExecutor(max_workers=4)
 VT_BASE_URL    = "https://www.virustotal.com/api/v3"
 ABUSE_BASE_URL = "https://api.abuseipdb.com/api/v2/check"
 
 def _vt_check_hash(sha256, timeout=5):
     cache_key = f"vt_hash:{sha256}"
-    if cache_key in _ti_cache: return _ti_cache[cache_key]
+    with _ti_cache_lock:
+        if cache_key in _ti_cache:
+              return _ti_cache[cache_key]
     if not VT_API_KEY: return {"checked": False, "malicious": False, "reason": "no_api_key"}
     try:
         import requests as _rq
@@ -535,14 +546,17 @@ def _vt_check_hash(sha256, timeout=5):
                       "total_engines": sum(stats.values()) if stats else 0, "names": data.get("names", [])[:3]}
         else:
             result = {"checked": False, "malicious": False, "reason": f"http_{r.status_code}"}
-        _ti_cache[cache_key] = result
+        with _ti_cache_lock:
+            _ti_cache[cache_key] = result
         return result
     except Exception as e:
         return {"checked": False, "malicious": False, "reason": str(e)[:80]}
 
 def _vt_check_url(target_url, timeout=5):
     cache_key = f"vt_url:{target_url}"
-    if cache_key in _ti_cache: return _ti_cache[cache_key]
+    with _ti_cache_lock:
+        if cache_key in _ti_cache:
+            return _ti_cache[cache_key]
     if not VT_API_KEY: return {"checked": False, "malicious": False, "reason": "no_api_key"}
     try:
         import requests as _rq, base64
@@ -559,13 +573,17 @@ def _vt_check_url(target_url, timeout=5):
         else:
             result = {"checked": False, "malicious": False, "reason": f"http_{r.status_code}"}
         _ti_cache[cache_key] = result
+        with _ti_cache_lock:
+            _ti_cache[cache_key] = result
         return result
     except Exception as e:
         return {"checked": False, "malicious": False, "reason": str(e)[:80]}
 
 def _abuseipdb_check(ip, timeout=5):
     cache_key = f"abuse:{ip}"
-    if cache_key in _ti_cache: return _ti_cache[cache_key]
+    with _ti_cache_lock:
+        if cache_key in _ti_cache:
+            return _ti_cache[cache_key]
     if not ABUSEIPDB_KEY: return {"checked": False, "malicious": False, "reason": "no_api_key"}
     try:
         import requests as _rq
@@ -580,6 +598,8 @@ def _abuseipdb_check(ip, timeout=5):
         else:
             result = {"checked": False, "malicious": False, "reason": f"http_{r.status_code}"}
         _ti_cache[cache_key] = result
+        with _ti_cache_lock:
+            _ti_cache[cache_key] = result
         return result
     except Exception as e:
         return {"checked": False, "malicious": False, "reason": str(e)[:80]}
