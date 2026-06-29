@@ -13,6 +13,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from email.header import decode_header as _dh
 
 from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
 from sentence_transformers import SentenceTransformer
@@ -22,6 +23,7 @@ from PIL import Image
 import Levenshtein
 import whois
 
+
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import cm
 from reportlab.lib import colors
@@ -30,6 +32,9 @@ from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, HRFlowable
 )
 from reportlab.lib.enums import TA_LEFT, TA_CENTER
+from orchestrator_agent import OrchestratorAgent
+
+
 
 # ══════════════════════════════════════════════════════════════
 # CONFIG
@@ -1150,54 +1155,107 @@ def health():
 async def analyze_eml(file: UploadFile = File(...)):
     if not file.filename.endswith(".eml"):
         raise HTTPException(400, "Fichier .eml requis")
-    raw = await file.read()
+ 
+    raw    = await file.read()
     parsed = parse_eml(raw)
     all_urls = list(set(parsed["urls_in_html"] + parsed["urls_in_text"]))
-    header_r = analyze_headers(parsed)
-    url_r    = analyze_urls(all_urls)
-    image_r  = analyze_images(parsed["images"])
-    attach_r = analyze_attachments(parsed["attachments"])
-    full_text = parsed["full_text"] + " " + image_r["ocr_text"]
-    text_r = analyze_text(full_text)
-    rag_r  = rag_search(full_text)
-    ti_r = threat_intel_check(urls=url_r["suspicious"][:3], ips=header_r["ips_found"][:3],
-                              hashes=[a["sha256"] for a in parsed["attachments"]][:2])
-    score_global = compute_global_score(header_r, url_r, image_r, attach_r, text_r, ti_r, mode="full")
-    report = generate_report(parsed, header_r, url_r, image_r, attach_r, text_r, rag_r, ti_r, score_global)
-    sigma_r = generate_sigma_rules(report, score_global, {"from":parsed["from"],"subject":parsed["subject"]})
-    alert_sent = send_soc_alert(report, parsed, score_global)
-    result = {"score_global": score_global, "verdict": report.get("verdict","?"),
-              "modules":{"headers":header_r,"urls":url_r,"images":image_r,"attachments":attach_r,
-                        "nlp":text_r,"rag":rag_r,"threat_intel":ti_r},
-              "report": report, "sigma_rules": sigma_r, "alert_sent": alert_sent,
-              "email_meta": {
-                 "from": parsed["from"],
-                 "to": parsed["to"],
-                 "reply_to": parsed["reply_to"],
-                 "return_path": parsed["return_path"],
-                 "subject": parsed["subject"],
-                 "date": parsed["date"],
-               }}
-    aid = save_analysis(result, mode="eml", sender=parsed["from"], subject=parsed["subject"], alert_sent=alert_sent)
+ 
+    # Instancier l'agent
+    agent = OrchestratorAgent(parsed=parsed, mode="full")
+ 
+    # Lancer le pipeline orchestré
+    result = agent.run(
+        fn_headers    = analyze_headers,
+        fn_urls       = analyze_urls,
+        fn_images     = analyze_images,
+        fn_attachments= analyze_attachments,
+        fn_text       = analyze_text,
+        fn_rag        = rag_search,
+        fn_ti         = threat_intel_check,
+        fn_report     = generate_report,
+        fn_sigma      = generate_sigma_rules,
+        EMPTY_HEADER  = EMPTY_HEADER,
+        EMPTY_IMAGE   = EMPTY_IMAGE,
+        EMPTY_ATTACH  = EMPTY_ATTACH,
+        all_urls      = all_urls,
+        full_text     = parsed["full_text"],
+    )
+ 
+    # Alertes SOC
+    alert_sent = send_soc_alert(result["report"], parsed, result["score_global"])
+    result["alert_sent"] = alert_sent
+ 
+    # Métadonnées email
+    result["email_meta"] = {
+        "from":        parsed["from"],
+        "to":          parsed["to"],
+        "reply_to":    parsed["reply_to"],
+        "return_path": parsed["return_path"],
+        "subject":     parsed["subject"],
+        "date":        parsed["date"],
+    }
+ 
+    # Sauvegarde SQLite
+    aid = save_analysis(
+        result, mode="eml",
+        sender=parsed["from"], subject=parsed["subject"],
+        alert_sent=alert_sent,
+    )
     result["analysis_id"] = aid
     return result
 
 @app.post("/analyze/text")
 async def analyze_text_endpoint(req: TextRequest):
-    text_r = analyze_text(req.text)
-    url_r  = analyze_urls(extract_urls(req.text))
-    rag_r  = rag_search(req.text)
-    ti_r   = threat_intel_check(urls=url_r["suspicious"][:2])
-    score_global = compute_global_score(EMPTY_HEADER, url_r, EMPTY_IMAGE, EMPTY_ATTACH, text_r, ti_r, mode="text_only")
-    report = generate_report({"from":req.sender,"subject":req.subject,"full_text":req.text},
-                             EMPTY_HEADER, url_r, EMPTY_IMAGE, EMPTY_ATTACH, text_r, rag_r, ti_r, score_global)
-    sigma_r = generate_sigma_rules(report, score_global, {"from":req.sender,"subject":req.subject})
-    result = {"score_global": score_global, "verdict": report.get("verdict","?"),
-              "nlp": text_r, "urls": url_r, "rag": rag_r, "threat_intel": ti_r,
-              "report": report, "sigma_rules": sigma_r,
-              "email_meta": {"from": req.sender, "subject": req.subject, 
-               "date": datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")}}
-    aid = save_analysis(result, mode="text", sender=req.sender or "", subject=req.subject or "", alert_sent=False)
+    all_urls = extract_urls(req.text)
+ 
+    # Parsed minimal compatible avec l'agent
+    parsed_minimal = {
+        "from":        req.sender or "",
+        "reply_to":    "",
+        "return_path": "",
+        "to":          "",
+        "subject":     req.subject or "",
+        "date":        datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000"),
+        "full_text":   req.text,
+        "images":      [],
+        "attachments": [],
+        "urls_in_html": [],
+        "urls_in_text": all_urls,
+        "headers":     {},
+        "_ips_found":  [],
+    }
+ 
+    agent = OrchestratorAgent(parsed=parsed_minimal, mode="text_only")
+ 
+    result = agent.run(
+        fn_headers    = analyze_headers,
+        fn_urls       = analyze_urls,
+        fn_images     = analyze_images,
+        fn_attachments= analyze_attachments,
+        fn_text       = analyze_text,
+        fn_rag        = rag_search,
+        fn_ti         = threat_intel_check,
+        fn_report     = generate_report,
+        fn_sigma      = generate_sigma_rules,
+        EMPTY_HEADER  = EMPTY_HEADER,
+        EMPTY_IMAGE   = EMPTY_IMAGE,
+        EMPTY_ATTACH  = EMPTY_ATTACH,
+        all_urls      = all_urls,
+        full_text     = req.text,
+    )
+ 
+    result["alert_sent"]  = False
+    result["email_meta"]  = {
+        "from":    req.sender or "",
+        "subject": req.subject or "",
+        "date":    parsed_minimal["date"],
+    }
+ 
+    aid = save_analysis(
+        result, mode="text",
+        sender=req.sender or "", subject=req.subject or "",
+        alert_sent=False,
+    )
     result["analysis_id"] = aid
     return result
 

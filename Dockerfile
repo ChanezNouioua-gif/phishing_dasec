@@ -23,6 +23,7 @@ RUN python -m pip install --no-cache-dir -r requirements.txt
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
 COPY api_v2.py .
+COPY orchestrator_agent.py . 
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -39,3 +40,5 @@ CMD ["uvicorn", "api_v2:app", "--host", "0.0.0.0", "--port", "8000", "--workers"
 COPY start.sh .
 RUN chmod +x start.sh
 CMD ["./start.sh"]
+
+
