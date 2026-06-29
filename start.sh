@@ -20,7 +20,7 @@ fi
 
 if [ ! -f "$BERT_DIR/config.json" ]; then
     echo "⏳ Téléchargement modèle BERT..."
-    gdown --folder "1oziQDzwGxmnvXknRiFsHonC7ydnjFNXo" -O $MODEL_DIR/distilbert-5000
+    gdown --folder "1oziQDzwGxmnvXknRiFsHonC7ydnjFNXo" -O $BERT_DIR
     echo "✅ Modèle BERT téléchargé"
 fi
 
