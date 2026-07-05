@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "DASEC",
-  description: "SOC Intelligence Platform",
+  title: "MailShield — SOC Threat Intelligence",
+  description: "Plateforme de détection de phishing basée sur l\'IA",
 };
 
 export default function RootLayout({

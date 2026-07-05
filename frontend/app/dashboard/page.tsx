@@ -261,7 +261,7 @@ export default function Dashboard() {
             </div>
             <div style={{ position: 'absolute', bottom: -2, right: -2, width: 8, height: 8, borderRadius: '50%', background: '#ef4444', border: '1.5px solid #0d1424' }} />
           </div>
-          <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.1em', color: '#f1f5f9' }}>DASEC</span>
+          <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.1em', color: '#f1f5f9' }}>MailShield</span>
           <div style={{ width: 1, height: 16, background: '#1e293b' }} />
           <span style={{ fontSize: 10, color: '#475569', letterSpacing: '0.04em' }}>SOC Intelligence Platform</span>
         </div>
