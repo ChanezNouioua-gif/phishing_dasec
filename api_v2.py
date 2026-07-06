@@ -1,4 +1,3 @@
-
 import re, os, sys, json, pickle, hashlib, time, uuid, yaml, sqlite3, threading
 import torch
 import numpy as np
@@ -54,7 +53,14 @@ os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 SLACK_TOKEN     = os.getenv("SLACK_TOKEN", "")
 SLACK_CHANNEL   = "#soc-alerts"
-SOC_THRESHOLD   = 0.65
+
+# Seuils de verdict — remontés suite à observation empirique : beaucoup d'emails
+# légitimes (headers SPF/DKIM absents en test, RAG qui remonte toujours une technique
+# MITRE "la plus proche" même hors sujet) atterrissaient entre 0.14 et 0.52 et étaient
+# classés SUSPECT. Ajustables via variables d'env sans redéploiement de code.
+SCORE_THRESHOLD_SUSPECT  = float(os.getenv("SCORE_THRESHOLD_SUSPECT", "0.40"))
+SCORE_THRESHOLD_PHISHING = float(os.getenv("SCORE_THRESHOLD_PHISHING", "0.70"))
+SOC_THRESHOLD   = SCORE_THRESHOLD_PHISHING
 
 KNOWN_BRANDS = [
     "paypal","microsoft","google","apple","amazon","netflix",
@@ -657,8 +663,18 @@ def extract_urls(text):
     return list(set(re.findall(r"https?://[^\s<>\"\']+|www\.[^\s<>\"\']+", text)))
 
 def get_domain(url):
+    """Extrait le domaine d'une URL (http(s)://... ou www...). Ne pas utiliser sur des adresses email."""
     m = re.search(r"(?:https?://)?(?:www\.)?([^/\s]+)", url)
     return m.group(1).lower() if m else ""
+
+def get_email_domain(addr):
+    """Extrait le domaine d'une adresse email, en ignorant le nom d'affichage
+    (ex: '\"NovaTech RH\" <hr-noreply@novatech-solutions.com>' -> 'novatech-solutions.com').
+    Distinct de get_domain(), qui est prévu pour des URLs et casse sur les display names."""
+    if not addr:
+        return ""
+    m = re.search(r'@([\w.\-]+)', addr)
+    return m.group(1).lower().rstrip(">").strip() if m else ""
 
 
 
@@ -750,14 +766,21 @@ def analyze_headers(parsed):
     if not spf_pass: findings.append("SPF absent ou échoué"); score += 0.20
     if not dkim_pass: findings.append("DKIM absent ou échoué"); score += 0.20
     if not dmarc_pass: findings.append("DMARC absent ou échoué"); score += 0.10
+
     from_addr, reply_to = parsed["from"], parsed["reply_to"]
-    if reply_to and from_addr and reply_to != from_addr:
-        findings.append(f"Reply-To ≠ From : {reply_to}"); score += 0.20
+    # FIX bug#1 : comparer les DOMAINES email (get_email_domain), pas les adresses brutes
+    # avec display name, qui ne matchent jamais (ex: '"X" <a@d.com>' != '<a@d.com>').
+    if reply_to and from_addr:
+        rtd, fd = get_email_domain(reply_to), get_email_domain(from_addr)
+        if rtd and fd and rtd != fd:
+            findings.append(f"Reply-To ({rtd}) ≠ From ({fd})"); score += 0.20
+
     return_path = parsed["return_path"]
     if return_path and from_addr:
-        fd, rd = get_domain(from_addr), get_domain(return_path)
+        fd, rd = get_email_domain(from_addr), get_email_domain(return_path)
         if fd and rd and fd != rd:
             findings.append(f"Return-Path ({rd}) ≠ From ({fd})"); score += 0.15
+
     mailer = parsed["x_mailer"].lower()
     for sm in ["mailchimp","sendgrid","phpmailer","massmailer","bulk"]:
         if sm in mailer:
@@ -925,6 +948,48 @@ def _call_llm(prompt):
         return llm_client.generate_content(prompt).text
     return ""
 
+def classify_verdict(score_global):
+    """Seule source de vérité pour le verdict. Le LLM ne doit JAMAIS décider seul du
+    label final — il peut se tromper ou halluciner (cf. cas 'SUSPECT' à 0.14).
+    """
+    if score_global >= SCORE_THRESHOLD_PHISHING:
+        return "PHISHING"
+    if score_global >= SCORE_THRESHOLD_SUSPECT:
+        return "SUSPECT"
+    return "LEGITIME"
+
+def classify_confidence(score_global):
+    """Confiance basée sur la distance du score aux seuils de bascule : un score loin
+    des seuils (ex: 0.05 ou 0.95) est classé avec confiance haute ; un score proche
+    d'une frontière (ex: 0.38 ou 0.68) est intrinsèquement ambigu -> confiance basse."""
+    nearest_boundary = min(abs(score_global - SCORE_THRESHOLD_SUSPECT),
+                           abs(score_global - SCORE_THRESHOLD_PHISHING))
+    if nearest_boundary >= 0.15:
+        return "haute"
+    if nearest_boundary >= 0.07:
+        return "moyenne"
+    return "faible"
+
+def _neutral_legitimate_report(score_global, header_r):
+    """Rapport de repli, cohérent, pour un email jugé LEGITIME après override du verdict LLM.
+    Evite de laisser une explication/recommandation 'phishing' résiduelle du LLM (bug#2)."""
+    auth_bits = []
+    if header_r.get("spf_pass"): auth_bits.append("SPF")
+    if header_r.get("dkim_pass"): auth_bits.append("DKIM")
+    if header_r.get("dmarc_pass"): auth_bits.append("DMARC")
+    auth_txt = ", ".join(auth_bits) + " conformes" if auth_bits else "authentification incomplète"
+    return {
+        "explication": (f"Score global faible ({score_global:.2f}) — email jugé légitime. "
+                        f"{auth_txt}. Aucun indicateur technique significatif de phishing détecté."),
+        "recommandation": "Aucune action requise.",
+        "indicateurs_cles": [],
+        # Le RAG renvoie toujours le match MITRE le plus proche, même sans rapport réel
+        # (recherche par similarité, pas de seuil). Sur un verdict LEGITIME, afficher
+        # une technique/campagne n'a pas de sens et sème la confusion côté SOC.
+        "campagne_probable": "Aucune",
+        "technique_attck": "N/A",
+    }
+
 def generate_report(parsed, header_r, url_r, image_r, attach_r, text_r, rag_r, ti_r, score_global):
     top_tech     = rag_r["techniques"][0] if rag_r["techniques"] else {}
     top_campaign = rag_r["campaigns"][0]  if rag_r["campaigns"]  else {}
@@ -933,17 +998,21 @@ def generate_report(parsed, header_r, url_r, image_r, attach_r, text_r, rag_r, t
     iocs_detected = ti_r.get("iocs_detected", [])
 
     if not llm_client:
-        verdict = ("PHISHING" if score_global >= 0.65 else "SUSPECT" if score_global >= 0.35 else "LEGITIME")
-        return {"verdict": verdict, "confiance": "haute" if score_global >= 0.75 else "moyenne",
+        verdict = classify_verdict(score_global)
+        base = {"verdict": verdict, "confiance": classify_confidence(score_global),
                 "score_final": score_global, "campagne_probable": top_campaign.get("campaign","Inconnue"),
                 "technique_attck": f"{top_tech.get('tech_id','')} — {top_tech.get('name','N/A')}",
                 "vecteur_attaque": "lien" if url_r["suspicious"] else "texte seul",
                 "indicateurs_cles": all_findings[:5],
                 "explication": f"Score {score_global:.2f}. {len(all_findings)} indicateurs. LLM indisponible.",
-                "recommandation": "Bloquer et quarantaine." if score_global >= 0.65 else "Vérification manuelle.",
+                "recommandation": "Bloquer et quarantaine." if verdict == "PHISHING" else
+                                   ("Vérification manuelle." if verdict == "SUSPECT" else "Aucune action requise."),
                 "iocs": {"urls_suspectes": url_r["suspicious"], "ips_malveillantes": header_r["ips_found"],
                          "hashes": [h["sha256"] for h in attach_r["suspicious_hashes"]]},
                 "sigma_hint": url_r["suspicious"][0] if url_r["suspicious"] else ""}
+        if verdict == "LEGITIME":
+            base.update(_neutral_legitimate_report(score_global, header_r))
+        return base
 
     urls_json   = _json.dumps(url_r["suspicious"])
     ips_json    = _json.dumps(header_r["ips_found"])
@@ -975,6 +1044,10 @@ MITRE   : {top_tech.get("tech_id","")} {top_tech.get("name","")} (sim={top_tech.
 APT     : {top_apt.get("name","")} (sim={top_apt.get("similarity",0)})
 Campagne: {top_campaign.get("campaign","")} — {top_campaign.get("actor","")} (sim={top_campaign.get("similarity",0)})
 
+IMPORTANT : le champ "verdict" DOIT être cohérent avec le score_global fourni ci-dessus
+(< 0.35 -> LEGITIME, 0.35-0.65 -> SUSPECT, >= 0.65 -> PHISHING). Ne contredis jamais le score
+dans "explication" ou "recommandation" : si le score indique un email légitime, dis-le clairement.
+
 Réponds STRICTEMENT avec un JSON valide, sans texte avant/après, sans markdown :
 
 {{"verdict": "PHISHING", "confiance": "haute", "score_final": {score_global}, "campagne_probable": "nom ou Aucune", "technique_attck": "T#### - nom", "vecteur_attaque": "lien", "indicateurs_cles": ["max 5, mentionne les hits VT/AbuseIPDB si presents"], "explication": "2-3 phrases SOC", "recommandation": "action", "iocs": {{"urls_suspectes": {urls_json}, "ips_malveillantes": {ips_json}, "hashes": {hashes_json}}}, "sigma_hint": "valeur"}}"""
@@ -984,18 +1057,31 @@ Réponds STRICTEMENT avec un JSON valide, sans texte avant/après, sans markdown
         raw = re.sub(r"```json|```", "", raw).strip()
         m   = re.search(r"\{.*\}", raw, re.DOTALL)
         result = _json.loads(m.group() if m else raw)
-        
-        # ← AJOUTE CES LIGNES : override le verdict LLM si score contredit
-        if score_global < 0.35 and result.get("verdict") == "PHISHING":
-            result["verdict"] = "LEGITIME"
-            result["confiance"] = "moyenne"
-        elif score_global < 0.55 and result.get("verdict") == "PHISHING":
-            result["verdict"] = "SUSPECT"
-        
+
+        # FIX bug#2 (durci) : le LLM ne décide plus JAMAIS seul du verdict ni de la
+        # confiance — trop peu fiable (on a observé des verdicts "SUSPECT"/"haute"
+        # à un score de 0.14). Le verdict/la confiance sont TOUJOURS recalculés à
+        # partir du score_global. Le LLM ne fournit que le texte explicatif, la
+        # campagne probable, la technique MITRE et les indicateurs.
+        final_verdict = classify_verdict(score_global)
+        llm_verdict    = result.get("verdict")
+        result["verdict"]   = final_verdict
+        result["confiance"] = classify_confidence(score_global)
+
+        if final_verdict == "LEGITIME":
+            # Le LLM peut avoir halluciné une explication "phishing" pour le verdict
+            # qu'il avait initialement choisi : on la neutralise systématiquement,
+            # pas seulement quand llm_verdict == "PHISHING".
+            result.update(_neutral_legitimate_report(score_global, header_r))
+        elif final_verdict == "SUSPECT" and llm_verdict == "PHISHING":
+            # Le LLM était trop alarmiste par rapport au score : on garde son
+            # explication (souvent encore utile) mais on adoucit la recommandation.
+            result["recommandation"] = "Vérification manuelle recommandée avant action."
+
         return result
     except Exception as e:
-        verdict = ("PHISHING" if score_global >= 0.65 else "SUSPECT" if score_global >= 0.35 else "LEGITIME")
-        return {"verdict": verdict, "confiance": "moyenne", "score_final": score_global,
+        verdict = classify_verdict(score_global)
+        base = {"verdict": verdict, "confiance": classify_confidence(score_global), "score_final": score_global,
                 "explication": f"Erreur LLM : {str(e)[:100]}",
                 "campagne_probable": top_campaign.get("campaign","N/A"),
                 "technique_attck": f"{top_tech.get('tech_id','')} {top_tech.get('name','')}",
@@ -1004,6 +1090,9 @@ Réponds STRICTEMENT avec un JSON valide, sans texte avant/après, sans markdown
                 "iocs": {"urls_suspectes": url_r["suspicious"], "ips_malveillantes": header_r["ips_found"],
                          "hashes": [h["sha256"] for h in attach_r["suspicious_hashes"]]},
                 "sigma_hint": url_r["suspicious"][0] if url_r["suspicious"] else ""}
+        if verdict == "LEGITIME":
+            base.update(_neutral_legitimate_report(score_global, header_r))
+        return base
 
 def _mitre_to_tag(technique_attck):
     m = re.search(r"T(\d{4})(?:\.(\d{3}))?", technique_attck or "")
