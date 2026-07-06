@@ -1166,6 +1166,8 @@ def _level_from_score(score):
     return "informational"
 
 def generate_sigma_rules(report, score_global, email_meta=None):
+    if report.get("verdict") == "LEGITIME":
+        return {"rules_count": 0, "rules": [], "combined_yaml": "# Aucune règle générée — email jugé légitime"}
     email_meta = email_meta or {}
     rules = []
     level = _level_from_score(score_global)

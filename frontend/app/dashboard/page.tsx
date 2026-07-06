@@ -5,7 +5,7 @@ import {
   Shield, AlertTriangle, Mail, FileText, Plug, RefreshCw,
   Settings, Activity, Download, Circle, Link, Eye,
   Binary, Cpu, ChevronRight, Search, Plus, Bell,
-  BarChart2, Database, Globe, Hash, Lock, Zap, X
+  BarChart2, Database, Globe, Hash, Lock, Zap, X, Users, Radio
 } from 'lucide-react'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'https://chaneznouioua-gif-mailshield.hf.space'
@@ -55,7 +55,7 @@ interface AnalyzeResult {
     threat_intel?: { score: number; iocs_detected: string[] }
     images?: { score: number; ocr_text: string; images_count: number; findings: string[] }
     attachments?: { score: number; attachments_count: number; suspicious_hashes: Array<{ filename: string; sha256: string; size: number }>; findings: string[] }
-    rag?: { techniques: Array<{ tech_id: string; name: string; tactics: string; similarity: number }>; apt_groups: Array<{ group_id: string; name: string; similarity: number }>; campaigns: Array<{ campaign: string; actor: string; severity: string; similarity: number }> }
+    rag?: { techniques: Array<{ tech_id: string; name: string; tactics: string; similarity: number }>; apt_groups: Array<{ group_id: string; name: string; aliases?: string; similarity: number }>; campaigns: Array<{ campaign: string; actor: string; severity: string; similarity: number }>; live_iocs?: Array<{ url: string; attack_type?: string; brand_target?: string; similarity: number }> }
   }
   nlp?: { bert_score: number; lr_score: number; score: number }
   urls?: { score: number; suspicious: string[]; findings: string[] }
@@ -78,6 +78,11 @@ interface AnalyzeResult {
 const scoreColor = (s: number) => s >= 0.7 ? '#ef4444' : s >= 0.4 ? '#f59e0b' : '#22c55e'
 const verdictColor = (v: string) => v === 'PHISHING' ? '#ef4444' : v === 'SUSPECT' ? '#f59e0b' : '#22c55e'
 const verdictBg = (v: string) => v === 'PHISHING' ? '#ef444420' : v === 'SUSPECT' ? '#f59e0b20' : '#22c55e20'
+
+// Shared card shells so every page reads as one system
+const cardStyle: React.CSSProperties = { background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, overflow: 'hidden' }
+const cardHeaderStyle: React.CSSProperties = { padding: '10px 14px', borderBottom: '1px solid #1e293b', fontSize: 11, fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }
+const emptyStateStyle: React.CSSProperties = { padding: 32, textAlign: 'center', color: '#475569', fontSize: 12 }
 
 function ScoreBar({ value, color, height = 3 }: { value: number; color: string; height?: number }) {
   return (
@@ -110,7 +115,7 @@ function SparkBars({ data }: { data: number[] }) {
 // MITRE badge
 function MitreBadge({ id }: { id: string }) {
   const colors = ['#3b82f6', '#8b5cf6', '#06b6d4', '#f59e0b', '#ef4444', '#10b981']
-  const color = colors[id.charCodeAt(1) % colors.length]
+  const color = colors[(id.charCodeAt(1) || 0) % colors.length]
   return (
     <span style={{ fontSize: 9, fontWeight: 700, padding: '2px 5px', borderRadius: 3, background: `${color}25`, color, border: `1px solid ${color}40`, fontFamily: 'monospace' }}>
       {id}
@@ -135,7 +140,7 @@ function SiemRow({ name, status, rules }: { name: string; status: 'connected' | 
 function NavItem({ icon, label, active, count, onClick }: { icon: React.ReactNode; label: string; active: boolean; count?: number; onClick?: () => void }) {
   return (
     <div onClick={onClick} style={{
-      display: 'flex', alignItems: 'center', gap: 9, padding: '7px 16px', cursor: 'pointer', fontSize: 12,
+      display: 'flex', alignItems: 'center', gap: 9, padding: '7px 16px', cursor: onClick ? 'pointer' : 'default', fontSize: 12,
       color: active ? '#3b82f6' : '#64748b',
       borderLeft: `2px solid ${active ? '#3b82f6' : 'transparent'}`,
       background: active ? '#3b82f620' : 'transparent',
@@ -150,6 +155,23 @@ function NavItem({ icon, label, active, count, onClick }: { icon: React.ReactNod
   )
 }
 
+// Small page header used by every dedicated page (except the three tabbed ones)
+function PageHeader({ icon, title, subtitle }: { icon: React.ReactNode; title: string; subtitle: string }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '2px 2px 4px' }}>
+      <div style={{ width: 28, height: 28, borderRadius: 6, background: '#3b82f620', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#3b82f6', flexShrink: 0 }}>
+        {icon}
+      </div>
+      <div>
+        <div style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0' }}>{title}</div>
+        <div style={{ fontSize: 10, color: '#475569' }}>{subtitle}</div>
+      </div>
+    </div>
+  )
+}
+
+type NavKey = 'dashboard' | 'alerts' | 'scanner' | 'sigma' | 'ioc' | 'pdf' | 'feeds' | 'mitre' | 'apt'
+
 export default function Dashboard() {
   const [health, setHealth] = useState<HealthData | null>(null)
   const [stats, setStats] = useState<StatsData | null>(null)
@@ -159,8 +181,9 @@ export default function Dashboard() {
   const [emlFile, setEmlFile] = useState<File | null>(null)
   const [analyzing, setAnalyzing] = useState(false)
   const [loading, setLoading] = useState(true)
-  const [activeNav, setActiveNav] = useState<'dashboard' | 'alerts' | 'scanner' | 'sigma' | 'ioc' | 'pdf' | 'feeds' | 'mitre' | 'apt'>('dashboard')
+  const [activeNav, setActiveNav] = useState<NavKey>('dashboard')
   const [pdfLoading, setPdfLoading] = useState(false)
+  const [pdfLoadingId, setPdfLoadingId] = useState<string | null>(null)
   const [time, setTime] = useState('')
   const [sparkData] = useState(() => Array.from({ length: 24 }, () => Math.floor(Math.random() * 20)))
   const fileRef = useRef<HTMLInputElement>(null)
@@ -204,13 +227,14 @@ export default function Dashboard() {
       const r = await fetch(`${API}/analyze/eml`, { method: 'POST', body: form })
       const d: AnalyzeResult = await r.json()
       setSelected(d); setSelectedId(d.analysis_id)
-      await fetchAll(); setActiveNav('alerts')
+      await fetchAll()
+      // Stay on the scanner tab — the diagnostic renders below the drop zone.
     } catch (e) { console.error(e) }
     finally { setAnalyzing(false) }
   }
 
   const downloadPdf = async (id: string) => {
-    setPdfLoading(true)
+    setPdfLoading(true); setPdfLoadingId(id)
     try {
       const r = await fetch(`${API}/report/pdf/${id}`)
       const blob = await r.blob()
@@ -219,7 +243,7 @@ export default function Dashboard() {
       a.download = `DASEC_report_${id.slice(0, 8)}.pdf`; a.click()
       URL.revokeObjectURL(url)
     } catch (e) { console.error(e) }
-    finally { setPdfLoading(false) }
+    finally { setPdfLoading(false); setPdfLoadingId(null) }
   }
 
   const phishingCount = stats?.by_verdict?.['PHISHING'] ?? 0
@@ -233,6 +257,8 @@ export default function Dashboard() {
   const ti = selected?.modules?.threat_intel ?? selected?.threat_intel
   const headers = selected?.modules?.headers
   const rag = selected?.modules?.rag ?? selected?.rag
+  const aptGroups = selected?.modules?.rag?.apt_groups ?? []
+  const liveIocs = selected?.modules?.rag?.live_iocs ?? []
 
   // Static MITRE techniques for coverage matrix
   const mitreMatrix = [
@@ -247,6 +273,123 @@ export default function Dashboard() {
     { name: 'Microsoft Sentinel', status: 'connected' as const, rules: 87 },
     { name: 'IBM QRadar', status: 'syncing' as const, rules: 44 },
   ]
+
+  // ── Reusable diagnostic block (used on both Scanner and Alerts pages) ──
+  const renderDiagnostic = (result: AnalyzeResult) => (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+
+      {/* Active threat card */}
+      <div style={{ background: '#0d1424', border: `1px solid ${verdictColor(result.verdict)}30`, borderRadius: 7, padding: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, flexWrap: 'wrap' as const, gap: 10 }}>
+          <div>
+            <div style={{ fontSize: 11, color: '#475569', marginBottom: 2 }}>Active threat analysis</div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0' }}>{result.report?.campagne_probable || 'Unknown campaign'}</div>
+            {result.email_meta && (
+              <div style={{ fontSize: 10, color: '#475569', marginTop: 3 }}>
+                {result.email_meta.from && `From: ${result.email_meta.from}`}
+                {result.email_meta.subject && ` · Subject: ${result.email_meta.subject}`}
+              </div>
+            )}
+          </div>
+          <div style={{ textAlign: 'right' }}>
+            <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 28, fontWeight: 700, color: verdictColor(result.verdict), lineHeight: 1 }}>
+              {result.score_global.toFixed(2)}
+            </div>
+            <div style={{ fontSize: 9, color: '#475569', marginTop: 2 }}>risk score</div>
+            <Pill color={verdictColor(result.verdict)} bg={verdictBg(result.verdict)}>{result.verdict}</Pill>
+          </div>
+        </div>
+
+        {/* Module scores */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginTop: 8 }}>
+          {[
+            { label: 'DistilBERT', value: nlp?.bert_score ?? 0, color: '#ef4444' },
+            { label: 'IoC score', value: ti?.score ?? 0, color: '#f59e0b' },
+            { label: 'RAG match', value: rag?.techniques?.[0]?.similarity ?? 0, color: '#8b5cf6' },
+            { label: 'Header', value: headers?.score ?? 0, color: '#3b82f6' },
+          ].map(s => (
+            <div key={s.label} style={{ background: '#0a1120', borderRadius: 6, padding: '8px 10px' }}>
+              <div style={{ fontSize: 9, color: '#475569', marginBottom: 3 }}>{s.label}</div>
+              <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 15, fontWeight: 700, color: s.color }}>{s.value.toFixed(2)}</div>
+              <ScoreBar value={s.value} color={s.color} height={2} />
+            </div>
+          ))}
+        </div>
+
+        {/* LLM explanation */}
+        <div style={{ marginTop: 10, padding: 10, background: '#0a1120', borderRadius: 6, fontSize: 11, color: '#64748b', lineHeight: 1.6 }}>
+          {result.report?.explication}
+        </div>
+
+        {/* Indicateurs clés */}
+        {result.report?.indicateurs_cles?.length > 0 && (
+          <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {result.report.indicateurs_cles.map((ind, i) => (
+              <div key={i} style={{ fontSize: 10, color: '#f59e0b', display: 'flex', alignItems: 'center', gap: 5 }}>
+                <div style={{ width: 3, height: 3, borderRadius: '50%', background: '#f59e0b', flexShrink: 0 }} /> {ind}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Actions */}
+        <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' as const }}>
+          {result.verdict === 'PHISHING' && (
+            <button style={{ padding: '6px 14px', borderRadius: 5, border: '1px solid #ef444460', background: '#ef444415', color: '#ef4444', fontSize: 11, fontWeight: 600, cursor: 'pointer' }}>
+              Block & quarantine
+            </button>
+          )}
+          <button onClick={() => downloadPdf(result.analysis_id)} disabled={pdfLoading} style={{ padding: '6px 14px', borderRadius: 5, border: '1px solid #3b82f660', background: 'transparent', color: '#3b82f6', fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5 }}>
+            <Download size={11} /> {pdfLoading ? 'Génération...' : 'Export PDF'}
+          </button>
+          <button onClick={() => setActiveNav('sigma')} style={{ padding: '6px 14px', borderRadius: 5, border: '1px solid #1e293b', background: 'transparent', color: '#64748b', fontSize: 11, cursor: 'pointer' }}>
+            Push to SIEM
+          </button>
+        </div>
+      </div>
+
+      {/* Headers */}
+      {headers && (
+        <div style={{ background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, padding: 14 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
+            <Lock size={12} color="#3b82f6" />
+            <span style={{ fontSize: 11, fontWeight: 600 }}>Header authentication</span>
+          </div>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' as const }}>
+            {[
+              { label: 'SPF', ok: headers.spf_pass },
+              { label: 'DKIM', ok: headers.dkim_pass },
+              { label: 'DMARC', ok: headers.dmarc_pass },
+            ].map(a => (
+              <span key={a.label} style={{ fontSize: 10, fontWeight: 700, padding: '3px 8px', borderRadius: 4, background: a.ok ? '#22c55e20' : '#ef444420', color: a.ok ? '#22c55e' : '#ef4444', border: `1px solid ${a.ok ? '#22c55e40' : '#ef444440'}` }}>
+                {a.label}: {a.ok ? 'PASS' : 'FAIL'}
+              </span>
+            ))}
+          </div>
+          {headers.findings.length > 0 && (
+            <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 3 }}>
+              {headers.findings.map((f, i) => (
+                <div key={i} style={{ fontSize: 10, color: '#f59e0b', display: 'flex', alignItems: 'center', gap: 5 }}>
+                  <div style={{ width: 3, height: 3, borderRadius: '50%', background: '#f59e0b', flexShrink: 0 }} /> {f}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Recommendation */}
+      {result.report?.recommandation && (
+        <div style={{ background: '#0d1424', border: '1px solid #22c55e30', borderRadius: 7, padding: 12, display: 'flex', gap: 10 }}>
+          <div style={{ width: 3, borderRadius: 2, background: '#22c55e', flexShrink: 0 }} />
+          <div>
+            <div style={{ fontSize: 10, color: '#22c55e', fontWeight: 600, marginBottom: 3 }}>SOC RECOMMENDATION</div>
+            <div style={{ fontSize: 11, color: '#94a3b8', lineHeight: 1.5 }}>{result.report.recommandation}</div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '200px 1fr', gridTemplateRows: '44px 1fr', height: '100vh', overflow: 'hidden', background: '#0a0f1a', color: '#e2e8f0', fontFamily: 'Inter, system-ui, sans-serif' }}>
@@ -302,7 +445,7 @@ export default function Dashboard() {
         <div style={{ padding: '12px 16px 4px', fontSize: 9, color: '#334155', letterSpacing: '0.12em', textTransform: 'uppercase', fontWeight: 600 }}>Intelligence</div>
         <NavItem icon={<Globe size={13}/>} label="Threat feeds" active={activeNav==='feeds'} onClick={() => setActiveNav('feeds')} />
         <NavItem icon={<Database size={13}/>} label="MITRE ATT&CK" active={activeNav==='mitre'} onClick={() => setActiveNav('mitre')} />
-        <NavItem icon={<Binary size={13}/>} label="APT groups" active={activeNav==='apt'} count={2} onClick={() => setActiveNav('apt')} />
+        <NavItem icon={<Binary size={13}/>} label="APT groups" active={activeNav==='apt'} count={aptGroups.length} onClick={() => setActiveNav('apt')} />
 
         <div style={{ padding: '12px 16px 4px', fontSize: 9, color: '#334155', letterSpacing: '0.12em', textTransform: 'uppercase', fontWeight: 600 }}>Integrations</div>
         <NavItem icon={<Plug size={13}/>} label="SIEM connectors" active={false} />
@@ -318,7 +461,7 @@ export default function Dashboard() {
           </div>
         ) : (
           <>
-            {/* ── KPI row ── */}
+            {/* ── KPI row — persistent summary across all pages ── */}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10 }}>
               {[
                 { label: 'Threats today', value: phishingCount + suspectCount, sub: `↑${Math.max(0,phishingCount-2)} vs yesterday`, subColor: '#ef4444', barColor: '#ef4444', barVal: (phishingCount+suspectCount)/Math.max(stats?.total_analyses??1,1) },
@@ -342,246 +485,468 @@ export default function Dashboard() {
               {/* ── Left ── */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
 
-                {/* Tab bar */}
-                <div style={{ display: 'flex', gap: 0, borderBottom: '1px solid #1e293b' }}>
-                  {[
-                    { id: 'alerts', label: 'Live alert feed' },
-                    { id: 'scanner', label: 'Email scanner' },
-                    { id: 'sigma', label: 'Sigma rules' },
-                  ].map(t => (
-                    <button key={t.id} onClick={() => setActiveNav(t.id as any)} style={{
-                      padding: '7px 16px', fontSize: 11, fontWeight: 500, background: 'transparent', border: 'none', cursor: 'pointer',
-                      color: activeNav === t.id ? '#3b82f6' : '#475569',
-                      borderBottom: `2px solid ${activeNav === t.id ? '#3b82f6' : 'transparent'}`,
-                      marginBottom: -1, fontFamily: 'Inter, sans-serif',
-                    }}>{t.label}</button>
-                  ))}
-                  <span style={{ marginLeft: 'auto', fontSize: 10, color: '#334155', alignSelf: 'center', paddingRight: 4 }}>auto-refresh 15s</span>
-                </div>
-
-                {/* ── Alert feed ── */}
-                {activeNav === 'alerts' && (
-                  <div style={{ background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, overflow: 'hidden' }}>
-                    {history.length === 0 ? (
-                      <div style={{ padding: 32, textAlign: 'center', color: '#475569', fontSize: 12 }}>
-                        No analyses yet — use the email scanner to start
-                      </div>
-                    ) : history.map(a => (
-                      <div key={a.analysis_id} onClick={() => loadDetail(a.analysis_id)} style={{
-                        display: 'flex', alignItems: 'flex-start', gap: 10, padding: '11px 14px',
-                        borderBottom: '1px solid #1e293b', cursor: 'pointer',
-                        background: selectedId === a.analysis_id ? '#1e293b' : 'transparent',
-                        transition: 'background 0.1s',
-                      }}>
-                        <div style={{ width: 3, borderRadius: 2, alignSelf: 'stretch', minHeight: 36, background: verdictColor(a.verdict), flexShrink: 0 }} />
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ fontSize: 12, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: '#e2e8f0' }}>
-                            {a.subject || a.sender || 'No subject'}
-                          </div>
-                          <div style={{ fontSize: 10, color: '#475569', marginTop: 3, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' as const }}>
-                            <Pill color={verdictColor(a.verdict)} bg={verdictBg(a.verdict)}>{a.verdict}</Pill>
-                            {a.verdict === 'PHISHING' && <Pill color="#ef4444" bg="#ef444415">CRITICAL</Pill>}
-                            {a.verdict === 'SUSPECT' && <Pill color="#f59e0b" bg="#f59e0b15">HIGH</Pill>}
-                            {a.verdict === 'LEGITIME' && <Pill color="#22c55e" bg="#22c55e15">CLEAN</Pill>}
-                            <span style={{ color: '#334155' }}>{a.technique_attck?.slice(0, 22) || 'N/A'}</span>
-                            <span style={{ color: '#1e3a5f' }}>·</span>
-                            <span style={{ color: '#334155' }}>{new Date(a.analyzed_at).toLocaleTimeString()}</span>
-                          </div>
-                        </div>
-                        <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 13, fontWeight: 700, color: verdictColor(a.verdict), flexShrink: 0 }}>
-                          {a.score_global.toFixed(2)}
-                        </div>
-                      </div>
+                {/* Tab bar — only for the three feed-style pages */}
+                {(activeNav === 'alerts' || activeNav === 'scanner' || activeNav === 'sigma') && (
+                  <div style={{ display: 'flex', gap: 0, borderBottom: '1px solid #1e293b' }}>
+                    {[
+                      { id: 'alerts', label: 'Live alert feed' },
+                      { id: 'scanner', label: 'Email scanner' },
+                      { id: 'sigma', label: 'Sigma rules' },
+                    ].map(t => (
+                      <button key={t.id} onClick={() => setActiveNav(t.id as NavKey)} style={{
+                        padding: '7px 16px', fontSize: 11, fontWeight: 500, background: 'transparent', border: 'none', cursor: 'pointer',
+                        color: activeNav === t.id ? '#3b82f6' : '#475569',
+                        borderBottom: `2px solid ${activeNav === t.id ? '#3b82f6' : 'transparent'}`,
+                        marginBottom: -1, fontFamily: 'Inter, sans-serif',
+                      }}>{t.label}</button>
                     ))}
+                    <span style={{ marginLeft: 'auto', fontSize: 10, color: '#334155', alignSelf: 'center', paddingRight: 4 }}>auto-refresh 15s</span>
                   </div>
                 )}
 
-                {/* ── Scanner ── */}
-                {activeNav === 'scanner' && (
-                  <div style={{ background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <Mail size={16} color="#3b82f6" />
-                      <h3 style={{ margin: 0, fontSize: 13, fontWeight: 600 }}>Email Analysis Engine</h3>
+                {/* ══════════════════════════ DASHBOARD (overview) ══════════════════════════ */}
+                {activeNav === 'dashboard' && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                    <PageHeader icon={<Activity size={14}/>} title="Operations overview" subtitle="Real-time posture across every scanned mailbox" />
+
+                    <div style={cardStyle}>
+                      <div style={cardHeaderStyle}>Verdict breakdown</div>
+                      <div style={{ padding: 14 }}>
+                        {['PHISHING','SUSPECT','LEGITIME'].map(v => {
+                          const count = stats?.by_verdict?.[v] ?? 0
+                          const total = stats?.total_analyses || 1
+                          const pct = count / total
+                          return (
+                            <div key={v} style={{ marginBottom: 12 }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>
+                                <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                  <Pill color={verdictColor(v)} bg={verdictBg(v)}>{v}</Pill>
+                                </span>
+                                <span>{count} · {(pct*100).toFixed(0)}%</span>
+                              </div>
+                              <ScoreBar value={pct} color={verdictColor(v)} height={5} />
+                            </div>
+                          )
+                        })}
+                      </div>
                     </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, fontSize: 11, color: '#475569' }}>
-                      {['Headers SMTP','Corps HTML/Texte','URLs & domaines','OCR images','Pièces jointes','Macros VBA','NLP DistilBERT','RAG MITRE','Threat Intelligence','Règles Sigma'].map(f => (
-                        <div key={f} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-                          <div style={{ width: 4, height: 4, borderRadius: '50%', background: '#22c55e', flexShrink: 0 }} /> {f}
+
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                      <div style={cardStyle}>
+                        <div style={cardHeaderStyle}>Top campaigns</div>
+                        {stats?.top_campaigns?.length ? stats.top_campaigns.map((c, i) => (
+                          <div key={i} style={{ padding: '9px 14px', borderBottom: '1px solid #0f172a', display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <Radio size={11} color="#8b5cf6" />
+                            <span style={{ flex: 1, fontSize: 11, color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const }}>{c.campaign}</span>
+                            <span style={{ fontSize: 11, fontFamily: 'monospace', color: '#334155' }}>{c.count}</span>
+                          </div>
+                        )) : <div style={emptyStateStyle}>No campaigns identified yet</div>}
+                      </div>
+                      <div style={cardStyle}>
+                        <div style={cardHeaderStyle}>Top MITRE techniques</div>
+                        {stats?.top_techniques?.length ? stats.top_techniques.map((t, i) => (
+                          <div key={i} style={{ padding: '9px 14px', borderBottom: '1px solid #0f172a', display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <MitreBadge id={t.technique?.split(' ')[0] || 'N/A'} />
+                            <span style={{ flex: 1, fontSize: 10, color: '#475569', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const }}>
+                              {t.technique?.includes(' ') ? t.technique.slice(t.technique.indexOf(' ')+1, 28) : t.technique}
+                            </span>
+                            <span style={{ fontSize: 11, fontFamily: 'monospace', color: '#334155' }}>{t.count}</span>
+                          </div>
+                        )) : <div style={emptyStateStyle}>No techniques identified yet</div>}
+                      </div>
+                    </div>
+
+                    <div style={cardStyle}>
+                      <div style={cardHeaderStyle}>
+                        Recent activity
+                        <button onClick={() => setActiveNav('alerts')} style={{ fontSize: 10, color: '#3b82f6', background: 'none', border: 'none', cursor: 'pointer' }}>View all →</button>
+                      </div>
+                      {history.length === 0 ? <div style={emptyStateStyle}>No analyses yet</div> : history.slice(0, 6).map(a => (
+                        <div key={a.analysis_id} onClick={() => loadDetail(a.analysis_id)} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 14px', borderBottom: '1px solid #0f172a', cursor: 'pointer' }}>
+                          <div style={{ width: 3, borderRadius: 2, alignSelf: 'stretch', minHeight: 24, background: verdictColor(a.verdict), flexShrink: 0 }} />
+                          <span style={{ flex: 1, fontSize: 11, color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const }}>{a.subject || a.sender || 'No subject'}</span>
+                          <Pill color={verdictColor(a.verdict)} bg={verdictBg(a.verdict)}>{a.verdict}</Pill>
+                          <span style={{ fontFamily: 'monospace', fontSize: 11, fontWeight: 700, color: verdictColor(a.verdict), width: 36, textAlign: 'right' }}>{a.score_global.toFixed(2)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* ══════════════════════════ ALERTS (live feed) ══════════════════════════ */}
+                {activeNav === 'alerts' && (
+                  <>
+                    <div style={cardStyle}>
+                      {history.length === 0 ? (
+                        <div style={emptyStateStyle}>No analyses yet — use the email scanner to start</div>
+                      ) : history.map(a => (
+                        <div key={a.analysis_id} onClick={() => loadDetail(a.analysis_id)} style={{
+                          display: 'flex', alignItems: 'flex-start', gap: 10, padding: '11px 14px',
+                          borderBottom: '1px solid #1e293b', cursor: 'pointer',
+                          background: selectedId === a.analysis_id ? '#1e293b' : 'transparent',
+                          transition: 'background 0.1s',
+                        }}>
+                          <div style={{ width: 3, borderRadius: 2, alignSelf: 'stretch', minHeight: 36, background: verdictColor(a.verdict), flexShrink: 0 }} />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 12, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: '#e2e8f0' }}>
+                              {a.subject || a.sender || 'No subject'}
+                            </div>
+                            <div style={{ fontSize: 10, color: '#475569', marginTop: 3, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' as const }}>
+                              <Pill color={verdictColor(a.verdict)} bg={verdictBg(a.verdict)}>{a.verdict}</Pill>
+                              {a.verdict === 'PHISHING' && <Pill color="#ef4444" bg="#ef444415">CRITICAL</Pill>}
+                              {a.verdict === 'SUSPECT' && <Pill color="#f59e0b" bg="#f59e0b15">HIGH</Pill>}
+                              {a.verdict === 'LEGITIME' && <Pill color="#22c55e" bg="#22c55e15">CLEAN</Pill>}
+                              <span style={{ color: '#334155' }}>{a.technique_attck?.slice(0, 22) || 'N/A'}</span>
+                              <span style={{ color: '#1e3a5f' }}>·</span>
+                              <span style={{ color: '#334155' }}>{new Date(a.analyzed_at).toLocaleTimeString()}</span>
+                            </div>
+                          </div>
+                          <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 13, fontWeight: 700, color: verdictColor(a.verdict), flexShrink: 0 }}>
+                            {a.score_global.toFixed(2)}
+                          </div>
                         </div>
                       ))}
                     </div>
 
-                    <div
-                      onClick={() => fileRef.current?.click()}
-                      onDragOver={e => e.preventDefault()}
-                      onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f?.name.endsWith('.eml')) setEmlFile(f) }}
-                      style={{ border: `2px dashed ${emlFile ? '#3b82f6' : '#1e3a5f'}`, borderRadius: 7, padding: '24px 16px', textAlign: 'center', cursor: 'pointer', background: emlFile ? '#3b82f608' : 'transparent', transition: 'all 0.2s' }}
-                    >
-                      {emlFile ? (
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
-                          <Mail size={16} color="#3b82f6" />
-                          <div style={{ textAlign: 'left' }}>
-                            <div style={{ fontSize: 12, fontWeight: 500, color: '#e2e8f0' }}>{emlFile.name}</div>
-                            <div style={{ fontSize: 10, color: '#475569' }}>{(emlFile.size/1024).toFixed(1)} KB · prêt à analyser</div>
-                          </div>
-                          <button onClick={e => { e.stopPropagation(); setEmlFile(null) }} style={{ marginLeft: 8, background: 'none', border: 'none', cursor: 'pointer', color: '#475569' }}><X size={13}/></button>
-                        </div>
-                      ) : (
-                        <>
-                          <Mail size={20} color="#334155" style={{ marginBottom: 8 }} />
-                          <div style={{ fontSize: 12, color: '#475569' }}>Déposer un fichier .eml ici</div>
-                          <div style={{ fontSize: 10, color: '#334155', marginTop: 3 }}>ou cliquer pour sélectionner</div>
-                        </>
-                      )}
-                    </div>
-                    <input ref={fileRef} type="file" accept=".eml" style={{ display: 'none' }} onChange={e => { if (e.target.files?.[0]) setEmlFile(e.target.files[0]) }} />
-
-                    <button onClick={analyze} disabled={!emlFile || analyzing} style={{
-                      padding: '10px', borderRadius: 6, border: 'none', fontWeight: 600, fontSize: 12,
-                      background: analyzing ? '#1e3a5f' : emlFile ? '#2563eb' : '#1e293b',
-                      color: emlFile ? '#fff' : '#475569', cursor: emlFile && !analyzing ? 'pointer' : 'not-allowed',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, transition: 'all 0.2s',
-                    }}>
-                      {analyzing ? <><RefreshCw size={13} style={{ animation: 'spin 1s linear infinite' }} /> Analyse en cours...</> : <><Zap size={13}/> Analyser le fichier .eml</>}
-                    </button>
-                  </div>
+                    {selected && renderDiagnostic(selected)}
+                  </>
                 )}
 
-                {/* ── Sigma ── */}
-                {activeNav === 'sigma' && selected?.sigma_rules && (
-                  <div style={{ background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, overflow: 'hidden' }}>
-                    <div style={{ padding: '10px 14px', borderBottom: '1px solid #1e293b', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                      <span style={{ fontSize: 11, fontWeight: 600 }}>{selected.sigma_rules.rules_count} rule(s) — ready to deploy</span>
-                      <button onClick={() => selectedId && downloadPdf(selectedId)} style={{ padding: '4px 10px', borderRadius: 5, border: '1px solid #3b82f6', background: 'transparent', color: '#3b82f6', fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
-                        <Download size={11} /> Export PDF
-                      </button>
-                    </div>
-                    <pre style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 10, color: '#64748b', lineHeight: 1.8, padding: 14, overflowX: 'auto', background: '#0a1120', margin: 0 }}>
-                      {selected.sigma_rules.combined_yaml.split('\n').map((line, i) => {
-                        const isKey = /^[a-z_]+:/.test(line.trim())
-                        const isTag = line.trim().startsWith('- attack.')
-                        const isTitle = line.trim().startsWith('title:')
-                        const color = isTitle ? '#3b82f6' : isKey ? '#22c55e' : isTag ? '#f59e0b' : '#475569'
-                        return <span key={i} style={{ color, display: 'block' }}>{line}</span>
-                      })}
-                    </pre>
-                  </div>
-                )}
-
-                {/* ── Selected analysis detail ── */}
-                {selected && activeNav === 'alerts' && (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-
-                    {/* Active threat card */}
-                    <div style={{ background: '#0d1424', border: `1px solid ${verdictColor(selected.verdict)}30`, borderRadius: 7, padding: 16 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-                        <div>
-                          <div style={{ fontSize: 11, color: '#475569', marginBottom: 2 }}>Active threat analysis</div>
-                          <div style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0' }}>{selected.report?.campagne_probable || 'Unknown campaign'}</div>
-                          {selected.email_meta && (
-                            <div style={{ fontSize: 10, color: '#475569', marginTop: 3 }}>
-                              {selected.email_meta.from && `From: ${selected.email_meta.from}`}
-                              {selected.email_meta.subject && ` · Subject: ${selected.email_meta.subject}`}
-                            </div>
-                          )}
-                        </div>
-                        <div style={{ textAlign: 'right' }}>
-                          <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 28, fontWeight: 700, color: verdictColor(selected.verdict), lineHeight: 1 }}>
-                            {selected.score_global.toFixed(2)}
-                          </div>
-                          <div style={{ fontSize: 9, color: '#475569', marginTop: 2 }}>risk score</div>
-                          <Pill color={verdictColor(selected.verdict)} bg={verdictBg(selected.verdict)}>{selected.verdict}</Pill>
-                        </div>
+                {/* ══════════════════════════ EMAIL SCANNER ══════════════════════════ */}
+                {activeNav === 'scanner' && (
+                  <>
+                    <div style={{ background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <Mail size={16} color="#3b82f6" />
+                        <h3 style={{ margin: 0, fontSize: 13, fontWeight: 600 }}>Email Analysis Engine</h3>
                       </div>
-
-                      {/* Module scores */}
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginTop: 8 }}>
-                        {[
-                          { label: 'DistilBERT', value: nlp?.bert_score ?? 0, color: '#ef4444' },
-                          { label: 'IoC score', value: ti?.score ?? 0, color: '#f59e0b' },
-                          { label: 'RAG match', value: rag?.techniques?.[0]?.similarity ?? 0, color: '#8b5cf6' },
-                          { label: 'Header', value: headers?.score ?? 0, color: '#3b82f6' },
-                        ].map(s => (
-                          <div key={s.label} style={{ background: '#0a1120', borderRadius: 6, padding: '8px 10px' }}>
-                            <div style={{ fontSize: 9, color: '#475569', marginBottom: 3 }}>{s.label}</div>
-                            <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 15, fontWeight: 700, color: s.color }}>{s.value.toFixed(2)}</div>
-                            <ScoreBar value={s.value} color={s.color} height={2} />
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, fontSize: 11, color: '#475569' }}>
+                        {['Headers SMTP','Corps HTML/Texte','URLs & domaines','OCR images','Pièces jointes','Macros VBA','NLP DistilBERT','RAG MITRE','Threat Intelligence','Règles Sigma'].map(f => (
+                          <div key={f} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                            <div style={{ width: 4, height: 4, borderRadius: '50%', background: '#22c55e', flexShrink: 0 }} /> {f}
                           </div>
                         ))}
                       </div>
 
-                      {/* LLM explanation */}
-                      <div style={{ marginTop: 10, padding: 10, background: '#0a1120', borderRadius: 6, fontSize: 11, color: '#64748b', lineHeight: 1.6 }}>
-                        {selected.report?.explication}
-                      </div>
-
-                      {/* Actions */}
-                      <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-                        {selected.verdict === 'PHISHING' && (
-                          <button style={{ padding: '6px 14px', borderRadius: 5, border: '1px solid #ef444460', background: '#ef444415', color: '#ef4444', fontSize: 11, fontWeight: 600, cursor: 'pointer' }}>
-                            Block & quarantine
-                          </button>
+                      <div
+                        onClick={() => fileRef.current?.click()}
+                        onDragOver={e => e.preventDefault()}
+                        onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f?.name.endsWith('.eml')) setEmlFile(f) }}
+                        style={{ border: `2px dashed ${emlFile ? '#3b82f6' : '#1e3a5f'}`, borderRadius: 7, padding: '24px 16px', textAlign: 'center', cursor: 'pointer', background: emlFile ? '#3b82f608' : 'transparent', transition: 'all 0.2s' }}
+                      >
+                        {emlFile ? (
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
+                            <Mail size={16} color="#3b82f6" />
+                            <div style={{ textAlign: 'left' }}>
+                              <div style={{ fontSize: 12, fontWeight: 500, color: '#e2e8f0' }}>{emlFile.name}</div>
+                              <div style={{ fontSize: 10, color: '#475569' }}>{(emlFile.size/1024).toFixed(1)} KB · prêt à analyser</div>
+                            </div>
+                            <button onClick={e => { e.stopPropagation(); setEmlFile(null) }} style={{ marginLeft: 8, background: 'none', border: 'none', cursor: 'pointer', color: '#475569' }}><X size={13}/></button>
+                          </div>
+                        ) : (
+                          <>
+                            <Mail size={20} color="#334155" style={{ marginBottom: 8 }} />
+                            <div style={{ fontSize: 12, color: '#475569' }}>Déposer un fichier .eml ici</div>
+                            <div style={{ fontSize: 10, color: '#334155', marginTop: 3 }}>ou cliquer pour sélectionner</div>
+                          </>
                         )}
-                        <button onClick={() => selectedId && downloadPdf(selectedId)} disabled={pdfLoading} style={{ padding: '6px 14px', borderRadius: 5, border: '1px solid #3b82f660', background: 'transparent', color: '#3b82f6', fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5 }}>
-                          <Download size={11} /> {pdfLoading ? 'Génération...' : 'Export PDF'}
-                        </button>
-                        <button onClick={() => setActiveNav('sigma')} style={{ padding: '6px 14px', borderRadius: 5, border: '1px solid #1e293b', background: 'transparent', color: '#64748b', fontSize: 11, cursor: 'pointer' }}>
-                          Push to SIEM
-                        </button>
                       </div>
+                      <input ref={fileRef} type="file" accept=".eml" style={{ display: 'none' }} onChange={e => { if (e.target.files?.[0]) setEmlFile(e.target.files[0]) }} />
+
+                      <button onClick={analyze} disabled={!emlFile || analyzing} style={{
+                        padding: '10px', borderRadius: 6, border: 'none', fontWeight: 600, fontSize: 12,
+                        background: analyzing ? '#1e3a5f' : emlFile ? '#2563eb' : '#1e293b',
+                        color: emlFile ? '#fff' : '#475569', cursor: emlFile && !analyzing ? 'pointer' : 'not-allowed',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, transition: 'all 0.2s',
+                      }}>
+                        {analyzing ? <><RefreshCw size={13} style={{ animation: 'spin 1s linear infinite' }} /> Analyse en cours...</> : <><Zap size={13}/> Analyser le fichier .eml</>}
+                      </button>
                     </div>
 
-                    {/* Headers */}
-                    {headers && (
-                      <div style={{ background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, padding: 14 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
-                          <Lock size={12} color="#3b82f6" />
-                          <span style={{ fontSize: 11, fontWeight: 600 }}>Header authentication</span>
+                    {/* Diagnostic result — appears right below the scanner once available */}
+                    {selected && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '2px 2px' }}>
+                          <div style={{ width: 4, height: 4, borderRadius: '50%', background: '#3b82f6' }} />
+                          <span style={{ fontSize: 10, color: '#475569', letterSpacing: '0.06em', textTransform: 'uppercase' as const }}>Diagnostic result</span>
                         </div>
-                        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' as const }}>
-                          {[
-                            { label: 'SPF', ok: headers.spf_pass },
-                            { label: 'DKIM', ok: headers.dkim_pass },
-                            { label: 'DMARC', ok: headers.dmarc_pass },
-                          ].map(a => (
-                            <span key={a.label} style={{ fontSize: 10, fontWeight: 700, padding: '3px 8px', borderRadius: 4, background: a.ok ? '#22c55e20' : '#ef444420', color: a.ok ? '#22c55e' : '#ef4444', border: `1px solid ${a.ok ? '#22c55e40' : '#ef444440'}` }}>
-                              {a.label}: {a.ok ? 'PASS' : 'FAIL'}
-                            </span>
-                          ))}
-                        </div>
-                        {headers.findings.length > 0 && (
-                          <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 3 }}>
-                            {headers.findings.map((f, i) => (
-                              <div key={i} style={{ fontSize: 10, color: '#f59e0b', display: 'flex', alignItems: 'center', gap: 5 }}>
-                                <div style={{ width: 3, height: 3, borderRadius: '50%', background: '#f59e0b', flexShrink: 0 }} /> {f}
-                              </div>
-                            ))}
-                          </div>
-                        )}
+                        {renderDiagnostic(selected)}
                       </div>
                     )}
+                  </>
+                )}
 
-                    {/* Recommendation */}
-                    {selected.report?.recommandation && (
-                      <div style={{ background: '#0d1424', border: '1px solid #22c55e30', borderRadius: 7, padding: 12, display: 'flex', gap: 10 }}>
-                        <div style={{ width: 3, borderRadius: 2, background: '#22c55e', flexShrink: 0 }} />
-                        <div>
-                          <div style={{ fontSize: 10, color: '#22c55e', fontWeight: 600, marginBottom: 3 }}>SOC RECOMMENDATION</div>
-                          <div style={{ fontSize: 11, color: '#94a3b8', lineHeight: 1.5 }}>{selected.report.recommandation}</div>
+                {/* ══════════════════════════ SIGMA RULES ══════════════════════════ */}
+                {activeNav === 'sigma' && (
+                  selected?.sigma_rules ? (
+                    <div style={cardStyle}>
+                      <div style={cardHeaderStyle}>
+                        <span>{selected.sigma_rules.rules_count} rule(s) — ready to deploy</span>
+                        <button onClick={() => selectedId && downloadPdf(selectedId)} style={{ padding: '4px 10px', borderRadius: 5, border: '1px solid #3b82f6', background: 'transparent', color: '#3b82f6', fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <Download size={11} /> Export PDF
+                        </button>
+                      </div>
+                      {selected.sigma_rules.rules_count === 0 ? (
+                        <div style={emptyStateStyle}>Aucune règle générée — email jugé légitime, rien à pousser vers le SIEM.</div>
+                      ) : (
+                        <pre style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 10, color: '#64748b', lineHeight: 1.8, padding: 14, overflowX: 'auto', background: '#0a1120', margin: 0 }}>
+                          {selected.sigma_rules.combined_yaml.split('\n').map((line, i) => {
+                            const isKey = /^[a-z_]+:/.test(line.trim())
+                            const isTag = line.trim().startsWith('- attack.')
+                            const isTitle = line.trim().startsWith('title:')
+                            const color = isTitle ? '#3b82f6' : isKey ? '#22c55e' : isTag ? '#f59e0b' : '#475569'
+                            return <span key={i} style={{ color, display: 'block' }}>{line}</span>
+                          })}
+                        </pre>
+                      )}
+                    </div>
+                  ) : (
+                    <div style={cardStyle}>
+                      <div style={emptyStateStyle}>Analyse un email depuis le scanner pour générer ses règles Sigma.</div>
+                    </div>
+                  )
+                )}
+
+                {/* ══════════════════════════ IOC TRACKER ══════════════════════════ */}
+                {activeNav === 'ioc' && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                    <PageHeader icon={<Search size={14}/>} title="IOC tracker" subtitle="Indicators of compromise surfaced across analyses" />
+
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
+                      {[
+                        { label: 'Total IOCs', value: stats?.total_iocs ?? 0, color: '#8b5cf6' },
+                        { label: 'URLHaus feed', value: health?.ioc_feeds?.urlhaus ?? 0, color: '#3b82f6' },
+                        { label: 'OpenPhish feed', value: health?.ioc_feeds?.openphish ?? 0, color: '#f59e0b' },
+                        { label: 'VirusTotal / AbuseIPDB', value: (health?.threat_intel_apis?.virustotal ? 1 : 0) + (health?.threat_intel_apis?.abuseipdb ? 1 : 0), color: '#22c55e' },
+                      ].map(k => (
+                        <div key={k.label} style={{ ...cardStyle, padding: '12px 14px' }}>
+                          <div style={{ fontSize: 10, color: '#475569', marginBottom: 4 }}>{k.label}</div>
+                          <div style={{ fontSize: 20, fontWeight: 700, fontFamily: 'monospace', color: k.color }}>{k.value.toLocaleString()}</div>
                         </div>
+                      ))}
+                    </div>
+
+                    <div style={cardStyle}>
+                      <div style={cardHeaderStyle}>
+                        {selected ? `IOCs — ${selected.email_meta?.subject || 'latest analysis'}` : 'IOCs — latest analysis'}
+                      </div>
+                      {selected?.report?.iocs && (selected.report.iocs.urls_suspectes.length || selected.report.iocs.ips_malveillantes.length || selected.report.iocs.hashes.length) ? (
+                        [
+                          ...selected.report.iocs.urls_suspectes.map(v => ({ type: 'URL', val: v, color: '#3b82f6', src: ti?.iocs_detected?.some(d => d.includes(v.slice(0,20))) ? `VT ${ti.score > 0 ? Math.round(ti.score*92)+'/92' : ''}` : 'pipeline' })),
+                          ...selected.report.iocs.ips_malveillantes.map(v => ({ type: 'IP', val: v, color: '#ef4444', src: 'AbuseIPDB' })),
+                          ...selected.report.iocs.hashes.map(v => ({ type: 'HASH', val: v, color: '#8b5cf6', src: 'VirusTotal' })),
+                        ].map((ioc, i) => (
+                          <div key={i} style={{ padding: '9px 14px', borderBottom: '1px solid #0f172a', display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <span style={{ fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 3, background: `${ioc.color}20`, color: ioc.color, flexShrink: 0 }}>{ioc.type}</span>
+                            <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 10, color: '#94a3b8', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const }}>{ioc.val}</span>
+                            <span style={{ fontSize: 9, color: '#334155', flexShrink: 0 }}>{ioc.src}</span>
+                          </div>
+                        ))
+                      ) : (
+                        <div style={emptyStateStyle}>No IOCs detected — analyse un email suspect pour peupler le tracker.</div>
+                      )}
+                    </div>
+
+                    {liveIocs.length > 0 && (
+                      <div style={cardStyle}>
+                        <div style={cardHeaderStyle}>Live IOC feed matches (RAG)</div>
+                        {liveIocs.map((l, i) => (
+                          <div key={i} style={{ padding: '9px 14px', borderBottom: '1px solid #0f172a', display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <Globe size={11} color="#f59e0b" style={{ flexShrink: 0 }} />
+                            <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 10, color: '#94a3b8', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const }}>{l.url}</span>
+                            <span style={{ fontSize: 9, color: '#334155', flexShrink: 0 }}>sim {l.similarity.toFixed(2)}</span>
+                          </div>
+                        ))}
                       </div>
                     )}
                   </div>
                 )}
+
+                {/* ══════════════════════════ PDF REPORTS ══════════════════════════ */}
+                {activeNav === 'pdf' && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                    <PageHeader icon={<FileText size={14}/>} title="PDF reports" subtitle="Download the full DASEC report for any past analysis" />
+                    <div style={cardStyle}>
+                      {history.length === 0 ? (
+                        <div style={emptyStateStyle}>No analyses yet — scan an email to generate your first report.</div>
+                      ) : history.map(a => (
+                        <div key={a.analysis_id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderBottom: '1px solid #0f172a' }}>
+                          <div style={{ width: 3, borderRadius: 2, alignSelf: 'stretch', minHeight: 28, background: verdictColor(a.verdict), flexShrink: 0 }} />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 12, color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const }}>{a.subject || a.sender || 'No subject'}</div>
+                            <div style={{ fontSize: 10, color: '#475569', marginTop: 2 }}>{new Date(a.analyzed_at).toLocaleString()}</div>
+                          </div>
+                          <Pill color={verdictColor(a.verdict)} bg={verdictBg(a.verdict)}>{a.verdict}</Pill>
+                          <span style={{ fontFamily: 'monospace', fontSize: 12, fontWeight: 700, color: verdictColor(a.verdict), width: 36, textAlign: 'right' }}>{a.score_global.toFixed(2)}</span>
+                          <button onClick={() => downloadPdf(a.analysis_id)} disabled={pdfLoading} style={{ padding: '5px 10px', borderRadius: 5, border: '1px solid #3b82f660', background: 'transparent', color: '#3b82f6', fontSize: 10, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0 }}>
+                            <Download size={11} /> {pdfLoadingId === a.analysis_id ? '...' : 'PDF'}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* ══════════════════════════ THREAT FEEDS ══════════════════════════ */}
+                {activeNav === 'feeds' && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                    <PageHeader icon={<Globe size={14}/>} title="Threat feeds" subtitle="External intelligence sources feeding the pipeline" />
+
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                      <div style={{ ...cardStyle, padding: 14 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                          <Circle size={6} fill="#22c55e" color="#22c55e" />
+                          <span style={{ fontSize: 12, fontWeight: 600 }}>URLHaus (abuse.ch)</span>
+                        </div>
+                        <div style={{ fontSize: 22, fontWeight: 700, fontFamily: 'monospace', color: '#3b82f6' }}>{(health?.ioc_feeds?.urlhaus ?? 0).toLocaleString()}</div>
+                        <div style={{ fontSize: 10, color: '#475569', marginTop: 2 }}>malicious URLs cached</div>
+                      </div>
+                      <div style={{ ...cardStyle, padding: 14 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                          <Circle size={6} fill="#22c55e" color="#22c55e" />
+                          <span style={{ fontSize: 12, fontWeight: 600 }}>OpenPhish</span>
+                        </div>
+                        <div style={{ fontSize: 22, fontWeight: 700, fontFamily: 'monospace', color: '#f59e0b' }}>{(health?.ioc_feeds?.openphish ?? 0).toLocaleString()}</div>
+                        <div style={{ fontSize: 10, color: '#475569', marginTop: 2 }}>phishing URLs cached</div>
+                      </div>
+                    </div>
+
+                    <div style={cardStyle}>
+                      <div style={cardHeaderStyle}>Threat intelligence APIs</div>
+                      {[
+                        { label: 'VirusTotal', ok: health?.threat_intel_apis?.virustotal, desc: 'hash & URL reputation lookups' },
+                        { label: 'AbuseIPDB', ok: health?.threat_intel_apis?.abuseipdb, desc: 'IP abuse confidence scoring' },
+                      ].map(s => (
+                        <div key={s.label} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderBottom: '1px solid #0f172a' }}>
+                          <Circle size={6} fill={s.ok ? '#22c55e' : '#ef4444'} color={s.ok ? '#22c55e' : '#ef4444'} />
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 12, color: '#e2e8f0' }}>{s.label}</div>
+                            <div style={{ fontSize: 10, color: '#475569' }}>{s.desc}</div>
+                          </div>
+                          <span style={{ fontSize: 10, color: s.ok ? '#22c55e' : '#ef4444', fontFamily: 'monospace' }}>{s.ok ? 'active' : 'no key'}</span>
+                        </div>
+                      ))}
+                    </div>
+
+                    {liveIocs.length > 0 ? (
+                      <div style={cardStyle}>
+                        <div style={cardHeaderStyle}>Latest live feed matches</div>
+                        {liveIocs.map((l, i) => (
+                          <div key={i} style={{ padding: '9px 14px', borderBottom: '1px solid #0f172a', display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <Link size={11} color="#3b82f6" style={{ flexShrink: 0 }} />
+                            <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 10, color: '#94a3b8', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const }}>{l.url}</span>
+                            <span style={{ fontSize: 9, color: '#334155', flexShrink: 0 }}>sim {l.similarity.toFixed(2)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div style={cardStyle}><div style={emptyStateStyle}>Analyse un email pour voir apparaître les correspondances de flux en direct.</div></div>
+                    )}
+                  </div>
+                )}
+
+                {/* ══════════════════════════ MITRE ATT&CK ══════════════════════════ */}
+                {activeNav === 'mitre' && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                    <PageHeader icon={<Database size={14}/>} title="MITRE ATT&CK" subtitle="Technique coverage inferred from analyzed emails" />
+
+                    <div style={cardStyle}>
+                      <div style={cardHeaderStyle}>Coverage matrix</div>
+                      <div style={{ padding: 14, display: 'flex', flexWrap: 'wrap' as const, gap: 6 }}>
+                        {mitreMatrix.map(t => {
+                          const isActive = stats?.top_techniques?.some(x => x.technique?.startsWith(t))
+                          const isDetected = selected?.report?.technique_attck?.includes(t.split('.')[0])
+                          return (
+                            <span key={t} style={{ fontSize: 10, fontWeight: 600, padding: '4px 7px', borderRadius: 3, fontFamily: 'monospace', background: isDetected ? '#ef444425' : isActive ? '#3b82f620' : '#1e293b', color: isDetected ? '#ef4444' : isActive ? '#3b82f6' : '#334155', border: `1px solid ${isDetected ? '#ef444440' : isActive ? '#3b82f630' : 'transparent'}` }}>
+                              {t}
+                            </span>
+                          )
+                        })}
+                      </div>
+                      <div style={{ padding: '4px 14px 12px', display: 'flex', gap: 14 }}>
+                        {[['#ef4444','Detected in current analysis'],['#3b82f6','Seen this week'],['#334155','Monitored']].map(([c,l]) => (
+                          <div key={l} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                            <div style={{ width: 7, height: 7, borderRadius: 1, background: c }} />
+                            <span style={{ fontSize: 9, color: '#334155' }}>{l}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div style={cardStyle}>
+                      <div style={cardHeaderStyle}>Techniques observed across all analyses</div>
+                      {stats?.top_techniques?.length ? stats.top_techniques.map((t, i) => (
+                        <div key={i} style={{ padding: '10px 14px', borderBottom: '1px solid #0f172a', display: 'flex', alignItems: 'center', gap: 10 }}>
+                          <MitreBadge id={t.technique?.split(' ')[0] || 'N/A'} />
+                          <span style={{ flex: 1, fontSize: 11, color: '#94a3b8' }}>{t.technique}</span>
+                          <span style={{ fontSize: 11, fontFamily: 'monospace', color: '#334155' }}>{t.count} hit(s)</span>
+                        </div>
+                      )) : <div style={emptyStateStyle}>No techniques logged yet</div>}
+                    </div>
+
+                    {rag?.techniques?.length ? (
+                      <div style={cardStyle}>
+                        <div style={cardHeaderStyle}>RAG matches — current analysis</div>
+                        {rag.techniques.map((t, i) => (
+                          <div key={i} style={{ padding: '10px 14px', borderBottom: '1px solid #0f172a', display: 'flex', alignItems: 'center', gap: 10 }}>
+                            <MitreBadge id={t.tech_id} />
+                            <div style={{ flex: 1 }}>
+                              <div style={{ fontSize: 11, color: '#e2e8f0' }}>{t.name}</div>
+                              <div style={{ fontSize: 9, color: '#475569' }}>{t.tactics}</div>
+                            </div>
+                            <span style={{ fontSize: 10, fontFamily: 'monospace', color: '#8b5cf6' }}>sim {t.similarity.toFixed(2)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+
+                {/* ══════════════════════════ APT GROUPS ══════════════════════════ */}
+                {activeNav === 'apt' && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                    <PageHeader icon={<Binary size={14}/>} title="APT groups" subtitle="Threat actors matched via RAG similarity search" />
+
+                    {aptGroups.length > 0 ? (
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                        {aptGroups.map((g, i) => (
+                          <div key={i} style={{ ...cardStyle, padding: 14 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                              <Users size={13} color="#8b5cf6" />
+                              <span style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0' }}>{g.name}</span>
+                            </div>
+                            <div style={{ fontSize: 10, color: '#475569', marginBottom: 8 }}>ID {g.group_id}{g.aliases ? ` · alias ${g.aliases}` : ''}</div>
+                            <div style={{ fontSize: 10, color: '#334155', marginBottom: 3 }}>Similarity match</div>
+                            <ScoreBar value={g.similarity} color="#8b5cf6" height={4} />
+                            <div style={{ fontSize: 10, fontFamily: 'monospace', color: '#8b5cf6', marginTop: 4 }}>{g.similarity.toFixed(2)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div style={cardStyle}><div style={emptyStateStyle}>Analyse un email pour faire remonter les groupes APT les plus proches.</div></div>
+                    )}
+
+                    <div style={cardStyle}>
+                      <div style={cardHeaderStyle}>Related campaigns tracked</div>
+                      {stats?.top_campaigns?.length ? stats.top_campaigns.map((c, i) => (
+                        <div key={i} style={{ padding: '9px 14px', borderBottom: '1px solid #0f172a', display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <Radio size={11} color="#8b5cf6" />
+                          <span style={{ flex: 1, fontSize: 11, color: '#94a3b8' }}>{c.campaign}</span>
+                          <span style={{ fontSize: 11, fontFamily: 'monospace', color: '#334155' }}>{c.count} email(s)</span>
+                        </div>
+                      )) : <div style={emptyStateStyle}>No campaigns identified yet</div>}
+                    </div>
+                  </div>
+                )}
               </div>
 
-              {/* ── Right column ── */}
+              {/* ── Right column — persistent context panel across all pages ── */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
 
-                {/* Monitored enterprises / System status */}
-                <div style={{ background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, overflow: 'hidden' }}>
-                  <div style={{ padding: '10px 14px', borderBottom: '1px solid #1e293b', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <span style={{ fontSize: 11, fontWeight: 600 }}>System status</span>
+                {/* System status */}
+                <div style={cardStyle}>
+                  <div style={cardHeaderStyle}>
+                    <span>System status</span>
                     <button style={{ fontSize: 10, color: '#3b82f6', background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3 }}>
                       <Plus size={10} /> Add
                     </button>
@@ -604,15 +969,15 @@ export default function Dashboard() {
                 </div>
 
                 {/* SIEM connectors */}
-                <div style={{ background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, overflow: 'hidden' }}>
-                  <div style={{ padding: '10px 14px', borderBottom: '1px solid #1e293b', fontSize: 11, fontWeight: 600 }}>SIEM connectors</div>
+                <div style={cardStyle}>
+                  <div style={cardHeaderStyle}>SIEM connectors</div>
                   {siemConnectors.map(s => <SiemRow key={s.name} {...s} />)}
                 </div>
 
                 {/* Top MITRE techniques */}
                 {stats?.top_techniques?.length ? (
-                  <div style={{ background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, overflow: 'hidden' }}>
-                    <div style={{ padding: '10px 14px', borderBottom: '1px solid #1e293b', fontSize: 11, fontWeight: 600 }}>Top MITRE techniques</div>
+                  <div style={cardStyle}>
+                    <div style={cardHeaderStyle}>Top MITRE techniques</div>
                     {stats.top_techniques.map((t, i) => (
                       <div key={i} style={{ padding: '7px 14px', borderBottom: '1px solid #0f172a', display: 'flex', alignItems: 'center', gap: 8 }}>
                         <MitreBadge id={t.technique?.split(' ')[0] || 'N/A'} />
@@ -625,12 +990,12 @@ export default function Dashboard() {
                   </div>
                 ) : null}
 
-                {/* IOC tracker */}
+                {/* IOC tracker (mini) */}
                 {selected?.report?.iocs && (
-                  <div style={{ background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, overflow: 'hidden' }}>
-                    <div style={{ padding: '10px 14px', borderBottom: '1px solid #1e293b', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                      <span style={{ fontSize: 11, fontWeight: 600 }}>IOC tracker</span>
-                      <button style={{ fontSize: 10, color: '#3b82f6', background: 'none', border: 'none', cursor: 'pointer' }}>Search</button>
+                  <div style={cardStyle}>
+                    <div style={cardHeaderStyle}>
+                      <span>IOC tracker</span>
+                      <button onClick={() => setActiveNav('ioc')} style={{ fontSize: 10, color: '#3b82f6', background: 'none', border: 'none', cursor: 'pointer' }}>Open</button>
                     </div>
                     {[
                       ...selected.report.iocs.urls_suspectes.map(v => ({ type: 'URL', val: v, color: '#3b82f6', src: ti?.iocs_detected?.some(d => d.includes(v.slice(0,20))) ? `VT ${ti.score > 0 ? Math.round(ti.score*92)+'/92' : ''}` : 'pipeline' })),
@@ -649,9 +1014,9 @@ export default function Dashboard() {
                   </div>
                 )}
 
-                {/* MITRE ATT&CK coverage */}
-                <div style={{ background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, overflow: 'hidden' }}>
-                  <div style={{ padding: '10px 14px', borderBottom: '1px solid #1e293b', fontSize: 11, fontWeight: 600 }}>MITRE ATT&CK coverage</div>
+                {/* MITRE ATT&CK coverage (mini) */}
+                <div style={cardStyle}>
+                  <div style={cardHeaderStyle}>MITRE ATT&CK coverage</div>
                   <div style={{ padding: '10px 14px', display: 'flex', flexWrap: 'wrap' as const, gap: 4 }}>
                     {mitreMatrix.map(t => {
                       const isActive = stats?.top_techniques?.some(x => x.technique?.startsWith(t))
@@ -674,9 +1039,9 @@ export default function Dashboard() {
                 </div>
 
                 {/* Volume chart */}
-                <div style={{ background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, overflow: 'hidden' }}>
-                  <div style={{ padding: '10px 14px', borderBottom: '1px solid #1e293b', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <span style={{ fontSize: 11, fontWeight: 600 }}>Volume — last 12h</span>
+                <div style={cardStyle}>
+                  <div style={cardHeaderStyle}>
+                    <span>Volume — last 12h</span>
                     <BarChart2 size={12} color="#334155" />
                   </div>
                   <div style={{ padding: '10px 14px 6px' }}>
@@ -696,8 +1061,8 @@ export default function Dashboard() {
                 </div>
 
                 {/* Knowledge base */}
-                <div style={{ background: '#0d1424', border: '1px solid #1e293b', borderRadius: 7, overflow: 'hidden' }}>
-                  <div style={{ padding: '10px 14px', borderBottom: '1px solid #1e293b', fontSize: 11, fontWeight: 600 }}>Knowledge base</div>
+                <div style={cardStyle}>
+                  <div style={cardHeaderStyle}>Knowledge base</div>
                   {health && Object.entries(health.rag_collections).map(([name, count]) => (
                     <div key={name} style={{ padding: '6px 14px', borderBottom: '1px solid #0f172a', display: 'flex', alignItems: 'center', gap: 8 }}>
                       <span style={{ flex: 1, fontSize: 10, color: '#475569' }}>{name.replace(/_/g,' ')}</span>
