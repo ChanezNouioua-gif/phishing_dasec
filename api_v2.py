@@ -663,19 +663,14 @@ def extract_urls(text):
     return list(set(re.findall(r"https?://[^\s<>\"\']+|www\.[^\s<>\"\']+", text)))
 
 def get_domain(url):
-    """Extrait le domaine d'une URL (http(s)://... ou www...). Ne JAMAIS utiliser sur
-    des adresses email ou des chaînes 'Display Name <addr>' — utiliser get_email_domain."""
+    """Extrait le domaine d'une URL (http(s)://... ou www...). Ne pas utiliser sur des adresses email."""
     m = re.search(r"(?:https?://)?(?:www\.)?([^/\s]+)", url)
     return m.group(1).lower() if m else ""
 
 def get_email_domain(addr):
     """Extrait le domaine d'une adresse email, en ignorant le nom d'affichage
     (ex: '\"NovaTech RH\" <hr-noreply@novatech-solutions.com>' -> 'novatech-solutions.com').
-    Seule fonction à utiliser pour comparer des adresses From/Reply-To/Return-Path —
-    ne jamais utiliser get_domain() (prévue pour des URLs) sur ces champs : appliquée à une
-    chaîne 'Display Name <addr>', get_domain() ne capture que le premier mot du nom
-    d'affichage (ex: 'novatech' au lieu de 'novatech-solutions.com'), ce qui génère de
-    faux positifs de type 'Return-Path ≠ From' même quand les deux domaines sont identiques."""
+    Distinct de get_domain(), qui est prévu pour des URLs et casse sur les display names."""
     if not addr:
         return ""
     m = re.search(r'@([\w.\-]+)', addr)
@@ -768,16 +763,12 @@ def analyze_headers(parsed):
     spf  = str(headers.get("Received-SPF", "")).lower()
     dkim = "dkim-signature" in {k.lower() for k in headers}
     spf_pass, dkim_pass, dmarc_pass = ("pass" in spf or "pass" in auth), (dkim and "dkim=pass" in auth), ("dmarc=pass" in auth)
-    if not spf_pass: findings.append("SPF absent ou échoué"); score += 0.20
-    if not dkim_pass: findings.append("DKIM absent ou échoué"); score += 0.20
-    if not dmarc_pass: findings.append("DMARC absent ou échoué"); score += 0.10
-
+    if not spf_pass: findings.append("SPF absent ou échoué"); score += 0.30
+    if not dkim_pass: findings.append("DKIM absent ou échoué"); score += 0.30
+    if not dmarc_pass: findings.append("DMARC absent ou échoué"); score += 0.15
     from_addr, reply_to = parsed["from"], parsed["reply_to"]
     # FIX bug#1 : comparer les DOMAINES email (get_email_domain), pas les adresses brutes
     # avec display name, qui ne matchent jamais (ex: '"X" <a@d.com>' != '<a@d.com>').
-    # IMPORTANT : ne jamais remplacer get_email_domain() par get_domain() ici (cf. docstring
-    # de get_domain) — c'est exactement ce qui provoque un faux "Return-Path ≠ From" alors
-    # que les deux adresses partagent le même domaine.
     if reply_to and from_addr:
         rtd, fd = get_email_domain(reply_to), get_email_domain(from_addr)
         if rtd and fd and rtd != fd:
@@ -792,10 +783,10 @@ def analyze_headers(parsed):
     mailer = parsed["x_mailer"].lower()
     for sm in ["mailchimp","sendgrid","phpmailer","massmailer","bulk"]:
         if sm in mailer:
-            findings.append(f"X-Mailer suspect : {parsed['x_mailer']}"); score += 0.10; break
+            findings.append(f"X-Mailer suspect : {parsed['x_mailer']}"); score += 0.15; break
     msg_id = parsed["message_id"]
     if not msg_id or not re.match(r"<.+@.+>", msg_id):
-        findings.append("Message-ID absent ou invalide"); score += 0.10
+        findings.append("Message-ID absent ou invalide"); score += 0.15
     received  = str(headers.get("Received", ""))
     ips_found = list(set(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", received)))
     return {"score": round(min(score, 1.0), 3), "spf_pass": spf_pass, "dkim_pass": dkim_pass,
@@ -814,10 +805,26 @@ def analyze_urls(urls):
         for tld in SUSPICIOUS_TLDS:
             if domain.endswith(tld):
                 findings.append(f"TLD suspect : {domain}"); score += 0.15; suspicious.append(url); break
+
+        # FIX bug#C : "paypa1-secure-login.ru" n'était jamais détecté comme typosquat
+        # car la distance de Levenshtein était calculée sur le label ENTIER
+        # ("paypa1-secure-login" vs "paypal" -> distance >> 2). On compare désormais
+        # aussi chaque segment (coupé sur les tirets/underscores) à chaque marque
+        # connue, ce qui capture la marque même noyée dans un domaine plus long.
         domain_base = domain.split(".")[0]
+        segments = list({domain_base, *re.split(r"[-_]", domain_base)})
+        typo_hit = False
         for brand in KNOWN_BRANDS:
-            if 0 < Levenshtein.distance(domain_base, brand) <= 2:
-                findings.append(f"Typosquatting : {domain} ≈ {brand}"); score += 0.25; suspicious.append(url); break
+            for seg in segments:
+                if seg and 0 < Levenshtein.distance(seg, brand) <= 2:
+                    findings.append(f"Typosquatting : {domain} (segment '{seg}' ≈ {brand})")
+                    score += 0.35  # signal fort : usurpation de marque probable
+                    suspicious.append(url)
+                    typo_hit = True
+                    break
+            if typo_hit:
+                break
+
         if len(domain) > 40: findings.append(f"Domaine trop long : {domain}"); score += 0.10
         if domain.count("-") >= 3: findings.append(f"Beaucoup de tirets : {domain}"); score += 0.10
         if re.match(r"https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", url):
@@ -981,7 +988,6 @@ def classify_confidence(score_global):
 def _neutral_legitimate_report(score_global, header_r):
     """Rapport de repli, cohérent, pour un email jugé LEGITIME après override du verdict LLM.
     Evite de laisser une explication/recommandation 'phishing' résiduelle du LLM (bug#2)."""
-    header_r = header_r or {}
     auth_bits = []
     if header_r.get("spf_pass"): auth_bits.append("SPF")
     if header_r.get("dkim_pass"): auth_bits.append("DKIM")
@@ -1103,48 +1109,6 @@ Réponds STRICTEMENT avec un JSON valide, sans texte avant/après, sans markdown
             base.update(_neutral_legitimate_report(score_global, header_r))
         return base
 
-# ══════════════════════════════════════════════════════════════
-# GARDE-FOU DE COHÉRENCE (nouveau)
-# ══════════════════════════════════════════════════════════════
-def enforce_report_consistency(result: dict) -> dict:
-    """Dernière ligne de défense, appelée juste après agent.run() dans les deux
-    endpoints d'analyse, AVANT toute alerte SOC ou sauvegarde en DB.
-
-    Pourquoi ce garde-fou existe : generate_report() ci-dessus recalcule déjà
-    verdict/confiance depuis score_global et neutralise l'explication quand le
-    verdict est LEGITIME. Mais ce recalcul ne protège que le chemin de code
-    interne à generate_report(). Si l'orchestrateur (OrchestratorAgent, dans un
-    fichier séparé qu'on ne contrôle pas ici) appelle generate_report autrement,
-    met en cache un résultat, ou modifie le report après coup, une incohérence
-    verdict/score/explication peut quand même ressortir de l'API (c'est
-    exactement ce qui s'est produit sur le cas 'Confirmation de vos congés' :
-    verdict LEGITIME à l'écran mais explication et recommandation de type
-    phishing, et un finding Return-Path/From basé sur des domaines mal extraits).
-
-    Ce garde-fou ne fait confiance à AUCUNE étape amont : il re-dérive tout
-    depuis result['score_global'] et, si besoin, écrase le report avant qu'il
-    ne parte en alerte SOC, en PDF, ou en base."""
-    report = result.get("report", {}) or {}
-    score_global = result.get("score_global", 0.0)
-
-    correct_verdict    = classify_verdict(score_global)
-    correct_confidence = classify_confidence(score_global)
-
-    incoherent = (
-        report.get("verdict") != correct_verdict or
-        report.get("confiance") != correct_confidence
-    )
-    if incoherent:
-        report["verdict"]   = correct_verdict
-        report["confiance"] = correct_confidence
-
-    if correct_verdict == "LEGITIME":
-        header_r = (result.get("modules", {}) or {}).get("headers", {}) or {}
-        report.update(_neutral_legitimate_report(score_global, header_r))
-
-    result["report"] = report
-    return result
-
 def _mitre_to_tag(technique_attck):
     m = re.search(r"T(\d{4})(?:\.(\d{3}))?", technique_attck or "")
     if not m: return "attack.t1566"
@@ -1166,8 +1130,6 @@ def _level_from_score(score):
     return "informational"
 
 def generate_sigma_rules(report, score_global, email_meta=None):
-    if report.get("verdict") == "LEGITIME":
-        return {"rules_count": 0, "rules": [], "combined_yaml": "# Aucune règle générée — email jugé légitime"}
     email_meta = email_meta or {}
     rules = []
     level = _level_from_score(score_global)
@@ -1303,7 +1265,9 @@ async def analyze_eml(file: UploadFile = File(...)):
     all_urls = list(set(parsed["urls_in_html"] + parsed["urls_in_text"]))
  
     # Instancier l'agent
-    agent = OrchestratorAgent(parsed=parsed, mode="full")
+    agent = OrchestratorAgent(parsed=parsed, mode="full",
+                              suspect_threshold=SCORE_THRESHOLD_SUSPECT,
+                              phishing_threshold=SCORE_THRESHOLD_PHISHING)
  
     # Lancer le pipeline orchestré
     result = agent.run(
@@ -1322,12 +1286,6 @@ async def analyze_eml(file: UploadFile = File(...)):
         all_urls      = all_urls,
         full_text     = parsed["full_text"],
     )
-
-    # GARDE-FOU : recalcule verdict/confiance/explication depuis score_global,
-    # quoi que l'orchestrateur ait renvoyé. Doit tourner AVANT l'alerte SOC et
-    # la sauvegarde, sinon une incohérence amont peut encore déclencher une
-    # fausse alerte Slack ou polluer l'historique.
-    result = enforce_report_consistency(result)
  
     # Alertes SOC
     alert_sent = send_soc_alert(result["report"], parsed, result["score_global"])
@@ -1373,7 +1331,9 @@ async def analyze_text_endpoint(req: TextRequest):
         "_ips_found":  [],
     }
  
-    agent = OrchestratorAgent(parsed=parsed_minimal, mode="text_only")
+    agent = OrchestratorAgent(parsed=parsed_minimal, mode="text_only",
+                              suspect_threshold=SCORE_THRESHOLD_SUSPECT,
+                              phishing_threshold=SCORE_THRESHOLD_PHISHING)
  
     result = agent.run(
         fn_headers    = analyze_headers,
@@ -1391,9 +1351,6 @@ async def analyze_text_endpoint(req: TextRequest):
         all_urls      = all_urls,
         full_text     = req.text,
     )
-
-    # GARDE-FOU (voir commentaire dans /analyze/eml)
-    result = enforce_report_consistency(result)
  
     result["alert_sent"]  = False
     result["email_meta"]  = {

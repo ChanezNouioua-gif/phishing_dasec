@@ -8,28 +8,39 @@ from datetime import datetime, timezone
 # Constantes de l'agent
 # ──────────────────────────────────────────────────────────────
 
-# Seuils de contradiction entre modules
+# Seuils de contradiction entre modules — les seuils de VERDICT (suspect/phishing)
+# ne sont plus dupliqués ici : ils sont passés au constructeur d'OrchestratorAgent
+# depuis api_v2.py (SCORE_THRESHOLD_SUSPECT / SCORE_THRESHOLD_PHISHING), pour éviter
+# la désynchronisation qu'on a eue (0.35/0.65 ici vs 0.40/0.70 dans api_v2.py).
 CONTRADICTION_DELTA   = 0.45   # écart score NLP vs URLs au-delà duquel on re-analyse
-LLM_OVERRIDE_FLOOR    = 0.30   # si score < 0.30 et LLM dit PHISHING → contradiction
-LLM_OVERRIDE_CEIL     = 0.75   # si score > 0.75 et LLM dit LEGITIME → contradiction
 EARLY_EXIT_THRESHOLD  = 0.88   # score brut suffisamment haut pour court-circuiter le LLM
 MAX_REANALYSIS_LOOPS  = 2      # nombre max de re-analyses pour éviter les boucles infinies
 
+# Seuils de verdict par défaut, utilisés seulement si l'appelant n'en fournit pas.
+# Doivent normalement être synchronisés avec SCORE_THRESHOLD_SUSPECT/PHISHING de api_v2.py.
+DEFAULT_SUSPECT_THRESHOLD  = 0.40
+DEFAULT_PHISHING_THRESHOLD = 0.70
+
 # Poids par mode (centralisés ici, plus dans compute_global_score)
+# FIX bug#4 : "ti" (VirusTotal/AbuseIPDB) est presque toujours à 0 pour du phishing
+# récent/inconnu des bases externes — c'est le cas le plus courant et le plus dangereux.
+# Le poids "urls" (typosquatting, TLD suspect, IP directe...) est le signal le plus
+# fiable et discriminant pour ce type d'attaque : on le monte, on baisse "ti" en
+# conséquence.
 WEIGHTS_FULL = {
     "headers":  0.20,
     "nlp":      0.20,
-    "urls":     0.20,
+    "urls":     0.30,   # était 0.20
     "attach":   0.15,
-    "ti":       0.15,
+    "ti":       0.05,   # était 0.15 — quasi toujours 0 sur du phishing "zero-day"
     "images":   0.05,
-    "url_susp": 0.05,   # bonus si URLs suspectes trouvées
+    "url_susp": 0.10,   # était 0.05 — signal fort, sous-valorisé
 }
 WEIGHTS_TEXT = {
-    "nlp":      0.30,
-    "urls":     0.45,
-    "ti":       0.20,
-    "url_susp": 0.05,
+    "nlp":      0.20,   # était 0.25 (0.30 à l'origine)
+    "urls":     0.55,
+    "ti":       0.15,
+    "url_susp": 0.10,   # était 0.05
 }
 
 # Types d'attaque détectables
@@ -101,15 +112,26 @@ class OrchestratorAgent:
       6. EARLY EXIT  — court-circuite le LLM si le verdict est déjà évident
     """
 
-    def __init__(self, parsed: dict, mode: str = "full"):
+    def __init__(self, parsed: dict, mode: str = "full",
+                 suspect_threshold: float = DEFAULT_SUSPECT_THRESHOLD,
+                 phishing_threshold: float = DEFAULT_PHISHING_THRESHOLD):
         """
         parsed : résultat de parse_eml() ou dict minimal pour mode text
         mode   : "full" (eml) | "text_only"
+        suspect_threshold / phishing_threshold : seuils de verdict, à passer depuis
+            api_v2.py (SCORE_THRESHOLD_SUSPECT / SCORE_THRESHOLD_PHISHING) pour que
+            les deux fichiers restent synchronisés sans import circulaire.
         """
         self.parsed = parsed
         self.mode   = mode
         self.dec    = AgentDecision()
         self._t0    = time.time()
+
+        self.suspect_threshold  = suspect_threshold
+        self.phishing_threshold = phishing_threshold
+        # Marges utilisées pour détecter une contradiction LLM vs score numérique.
+        self.llm_override_floor = max(0.0, suspect_threshold - 0.10)
+        self.llm_override_ceil  = min(1.0, phishing_threshold + 0.05)
 
     # ── 1. ROUTER ─────────────────────────────────────────────
 
@@ -172,16 +194,36 @@ class OrchestratorAgent:
 
     # ── 3. EARLY EXIT ─────────────────────────────────────────
 
-    def check_early_exit(self, partial_scores: dict) -> Optional[str]:
+    # Indicateurs "certains" — preuve quasi-directe de malveillance, indépendante
+    # de toute pondération probabiliste. Le texte/NLP (DistilBERT/LR) n'apparaît
+    # JAMAIS ici : c'est un signal de modèle, probabiliste par nature, il reste
+    # un contributeur pondéré du score global mais ne doit jamais, seul, forcer
+    # un verdict PHISHING.
+    _CERTAIN_FINDING_MARKERS = (
+        "URLHaus blacklist",
+        "OpenPhish blacklist",
+        "Hash malveillant",
+        "URL malveillante (VT",
+        "IP malveillante (AbuseIPDB",
+        "Double extension dangereuse",
+        "Macros VBA",
+    )
+
+    def check_early_exit(self,
+                         header_r: dict, url_r: dict, attach_r: dict,
+                         image_r: dict, text_r: dict, ti_r: dict) -> Optional[str]:
         """
         Appelé après les modules déterministes (avant LLM/RAG).
         Retourne "PHISHING" / "LEGITIME" / None.
+
+        Le score NLP (text_r) n'intervient QUE dans la formule combinée du Cas 4
+        (score brut), jamais comme déclencheur autonome — voir _CERTAIN_FINDING_MARKERS.
         """
-        header_s = partial_scores.get("headers", 0.0)
-        url_s    = partial_scores.get("urls", 0.0)
-        attach_s = partial_scores.get("attachments", 0.0)
-        nlp_s    = partial_scores.get("nlp", 0.0)
-        ti_s     = partial_scores.get("ti", 0.0)
+        header_s = header_r.get("score", 0.0)
+        url_s    = url_r.get("score", 0.0)
+        attach_s = attach_r.get("score", 0.0)
+        nlp_s    = text_r.get("score", 0.0)
+        ti_s     = ti_r.get("score", 0.0)
 
         # Cas 1 — IOC confirmé VirusTotal/AbuseIPDB → verdict immédiat
         if ti_s >= 0.85:
@@ -197,7 +239,30 @@ class OrchestratorAgent:
             self._log(f"🚨 EARLY EXIT PHISHING : {self.dec.early_exit_reason}")
             return "PHISHING"
 
+        # Cas 2bis — URL en liste noire confirmée (URLHaus/OpenPhish) ou score URL
+        # très élevé (typosquat + TLD + autres red flags cumulés)
+        if url_s >= 0.80:
+            self.dec.early_exit = True
+            self.dec.early_exit_reason = f"URL fortement suspecte/blacklistée (url score={url_s:.2f})"
+            self._log(f"🚨 EARLY EXIT PHISHING : {self.dec.early_exit_reason}")
+            return "PHISHING"
+
+        # Cas 2ter — Scan direct des indicateurs "certains" dans les findings bruts,
+        # indépendamment du score agrégé (au cas où d'autres modules bas noient le
+        # signal dans la moyenne pondérée)
+        all_findings_text = " | ".join(
+            header_r.get("findings", []) + url_r.get("findings", []) +
+            attach_r.get("findings", []) + image_r.get("findings", [])
+        )
+        for marker in self._CERTAIN_FINDING_MARKERS:
+            if marker in all_findings_text:
+                self.dec.early_exit = True
+                self.dec.early_exit_reason = f"Indicateur certain détecté : '{marker}'"
+                self._log(f"🚨 EARLY EXIT PHISHING : {self.dec.early_exit_reason}")
+                return "PHISHING"
+
         # Cas 3 — Score brut global déjà très haut → skip LLM
+        # (le NLP participe ICI, mais dilué avec 3 autres signaux — jamais seul)
         raw = (header_s * 0.25 + url_s * 0.30 + nlp_s * 0.25 + ti_s * 0.20)
         if raw >= EARLY_EXIT_THRESHOLD:
             self.dec.early_exit = True
@@ -251,20 +316,20 @@ class OrchestratorAgent:
             self._log(f"⚠️  CONTRADICTION : {c['detail']} — re-analyse : {dominant}")
 
         # Contradiction 2 — LLM contredit le score numérique
-        if llm_verd == "PHISHING" and score_global < LLM_OVERRIDE_FLOOR:
+        if llm_verd == "PHISHING" and score_global < self.llm_override_floor:
             c = {
                 "type": "llm_overreach",
-                "detail": f"LLM=PHISHING mais score={score_global:.2f} < {LLM_OVERRIDE_FLOOR}",
+                "detail": f"LLM=PHISHING mais score={score_global:.2f} < {self.llm_override_floor:.2f}",
                 "module_to_retry": "llm",
                 "reason": "LLM sur-détecte — score numérique trop bas pour confirmer",
             }
             contradictions.append(c)
             self._log(f"⚠️  CONTRADICTION : {c['detail']}")
 
-        if llm_verd == "LEGITIME" and score_global > LLM_OVERRIDE_CEIL:
+        if llm_verd == "LEGITIME" and score_global > self.llm_override_ceil:
             c = {
                 "type": "llm_underreach",
-                "detail": f"LLM=LEGITIME mais score={score_global:.2f} > {LLM_OVERRIDE_CEIL}",
+                "detail": f"LLM=LEGITIME mais score={score_global:.2f} > {self.llm_override_ceil:.2f}",
                 "module_to_retry": "llm",
                 "reason": "LLM sous-détecte — score numérique fort contredit le verdict LLM",
             }
@@ -428,6 +493,25 @@ class OrchestratorAgent:
                 (len(url_r.get("suspicious", [])) > 0) * WEIGHTS_FULL["url_susp"]
             )
 
+        # Bonus de convergence : plusieurs indicateurs FAIBLES mais INDÉPENDANTS qui
+        # pointent tous dans la même direction (headers + urls + nlp + ...) sont un
+        # signal bien plus fort que leur simple somme pondérée ne le laisse penser.
+        # Sans ce bonus, un email cumulant "pas d'auth" + "typosquat" + "urgence" +
+        # "mailer suspect" pouvait rester sous le seuil PHISHING malgré 4+ red flags
+        # clairement convergents.
+        total_findings = (
+            len(header_r.get("findings", [])) +
+            len(url_r.get("findings", [])) +
+            len(image_r.get("findings", [])) +
+            len(attach_r.get("findings", []))
+        )
+        if total_findings >= 6:
+            score += 0.15
+        elif total_findings >= 4:
+            score += 0.10
+        elif total_findings >= 3:
+            score += 0.05
+
         return round(min(score, 1.0), 4)
 
     # ── 8. RESOLVE CONTRADICTIONS ─────────────────────────────
@@ -440,8 +524,14 @@ class OrchestratorAgent:
         """
         Résout les contradictions et retourne le verdict final corrigé.
         Appelé après judge() si des contradictions sont détectées.
+
+        FIX bug#A : quand le verdict change ici, on régénère aussi explication/
+        recommandation/campagne/technique — sinon on garde le texte généré pour
+        l'ANCIEN verdict (ex: badge SUSPECT affiché à côté d'un texte "email
+        jugé légitime, aucune action requise").
         """
         verdict = report.get("verdict", "SUSPECT")
+        original_verdict = verdict
         changes = []
 
         for c in contradictions:
@@ -449,14 +539,14 @@ class OrchestratorAgent:
 
             if ctype == "llm_overreach":
                 # LLM dit PHISHING mais score trop bas
-                new_v = "SUSPECT" if score_global >= 0.35 else "LEGITIME"
+                new_v = "SUSPECT" if score_global >= self.suspect_threshold else "LEGITIME"
                 if verdict != new_v:
                     changes.append(f"Verdict corrigé {verdict} → {new_v} (LLM sur-détection)")
                     verdict = new_v
 
             elif ctype == "llm_underreach":
                 # LLM dit LEGITIME mais score trop haut
-                new_v = "PHISHING" if score_global >= 0.65 else "SUSPECT"
+                new_v = "PHISHING" if score_global >= self.phishing_threshold else "SUSPECT"
                 if verdict != new_v:
                     changes.append(f"Verdict corrigé {verdict} → {new_v} (LLM sous-détection)")
                     verdict = new_v
@@ -475,7 +565,7 @@ class OrchestratorAgent:
 
             elif ctype == "nlp_url_divergence":
                 # Divergence NLP/URLs — si on a des URLs suspectes, pencher vers SUSPECT minimum
-                if score_global >= 0.45 and verdict == "LEGITIME":
+                if score_global >= self.suspect_threshold + 0.10 and verdict == "LEGITIME":
                     changes.append(f"Verdict maintenu SUSPECT minimum (divergence NLP/URLs)")
                     verdict = "SUSPECT"
 
@@ -483,7 +573,24 @@ class OrchestratorAgent:
             for change in changes:
                 self._log(f"🔧 RÉSOLUTION : {change}")
             self.dec.reanalysis_log.extend(changes)
-        
+
+        # FIX : régénérer le texte si le verdict a effectivement changé, pour ne
+        # jamais laisser un texte incohérent avec le badge final affiché.
+        if verdict != original_verdict:
+            reasons = "; ".join(changes) if changes else "réévaluation des contradictions"
+            if verdict == "LEGITIME":
+                report["explication"]      = f"Verdict réévalué à LEGITIME ({reasons}). Score={score_global:.2f}."
+                report["recommandation"]   = "Aucune action requise."
+                report["indicateurs_cles"] = []
+                report["campagne_probable"] = "Aucune"
+                report["technique_attck"]   = "N/A"
+            elif verdict == "SUSPECT":
+                report["explication"]    = f"Verdict réévalué à SUSPECT ({reasons}). Score={score_global:.2f}."
+                report["recommandation"] = "Vérification manuelle requise avant classement définitif."
+            elif verdict == "PHISHING":
+                report["explication"]    = f"Verdict réévalué à PHISHING ({reasons}). Score={score_global:.2f}."
+                report["recommandation"] = "Bloquer et mettre en quarantaine immédiatement."
+
         report["verdict"] = verdict
         return report
 
@@ -568,14 +675,7 @@ class OrchestratorAgent:
 
             # ── Vérification Early Exit après TI ─────────────
             if module == "threat_intel":
-                partial = {
-                    "headers":     header_r.get("score", 0.0),
-                    "urls":        url_r.get("score", 0.0),
-                    "attachments": attach_r.get("score", 0.0),
-                    "nlp":         text_r.get("score", 0.0),
-                    "ti":          ti_r.get("score", 0.0),
-                }
-                early_verdict = self.check_early_exit(partial)
+                early_verdict = self.check_early_exit(header_r, url_r, attach_r, image_r, text_r, ti_r)
                 if early_verdict:
                     # Skip LLM
                     cfg["llm"] = False
@@ -587,6 +687,17 @@ class OrchestratorAgent:
 
         # ── Step 3 : Calcul du score global ───────────────────
         score_global = self.compute_score(header_r, url_r, image_r, attach_r, text_r, ti_r)
+
+        # Si un verdict a été forcé par early exit (indicateur "certain" :
+        # pièce jointe dangereuse, IOC confirmé VT/AbuseIPDB, blacklist URL...),
+        # le score numérique affiché doit rester cohérent avec ce verdict — sinon
+        # on revoit le cas confus "score=0.38 mais badge=PHISHING".
+        if early_verdict == "PHISHING":
+            score_global = max(score_global, self.phishing_threshold + 0.05)
+        elif early_verdict == "LEGITIME":
+            score_global = min(score_global, max(0.0, self.suspect_threshold - 0.05))
+        score_global = round(min(score_global, 1.0), 4)
+
         self._log(f"📈 Score global : {score_global:.4f}")
 
         # ── Step 4 : Génération du rapport (LLM ou fallback) ──
