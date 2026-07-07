@@ -1,4 +1,14 @@
-# 🛡️ DASEC - AI-Powered Phishing Detection and SOC Assistance Platform
+---
+title: MailShield2
+emoji: 🛡️
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
+
+
+# 🛡️ MailShield DASEC - AI-Powered Phishing Detection and SOC Assistance Platform
 
 <p align="center">
 
